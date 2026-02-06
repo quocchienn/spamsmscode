@@ -96,7 +96,7 @@ def format_device_id(device_id):
 
 def is_admin(user_id):
     """Kiểm tra xem user có phải admin không"""
-    if not bot_settings_collection:
+    if bot_settings_collection is None:
         return False
     
     settings = bot_settings_collection.find_one({})
@@ -107,7 +107,7 @@ def is_admin(user_id):
 
 def get_user_info(user_id):
     """Lấy thông tin user từ database hoặc tạo mới"""
-    if not users_collection:
+    if users_collection is None:
         return {
             'user_id': user_id,
             'username': '',
@@ -136,7 +136,7 @@ def get_user_info(user_id):
 
 def log_spam_action(user_id, phone_number, count, success=True):
     """Ghi log spam vào database"""
-    if spam_logs_collection:
+    if spam_logs_collection is not None:
         log_entry = {
             'user_id': user_id,
             'phone_number': phone_number,
@@ -147,7 +147,7 @@ def log_spam_action(user_id, phone_number, count, success=True):
         spam_logs_collection.insert_one(log_entry)
     
     # Cập nhật số lần spam của user
-    if users_collection:
+    if users_collection is not None:
         users_collection.update_one(
             {'user_id': user_id},
             {'$inc': {'spam_count': count}, '$set': {'last_spam': datetime.now()}}
@@ -155,7 +155,7 @@ def log_spam_action(user_id, phone_number, count, success=True):
 
 def check_spam_limit(user_id):
     """Kiểm tra giới hạn spam trong ngày"""
-    if not bot_settings_collection or not spam_logs_collection:
+    if bot_settings_collection is None or spam_logs_collection is None:
         return True  # Nếu không có DB, không giới hạn
     
     settings = bot_settings_collection.find_one({})
@@ -3324,7 +3324,6 @@ def send_otp_via_takomo(sdt):
 ##################################################################################################################################################################################
 
 ##################################################################################################################################################################################
-
 # Thêm các hàm OTP khác ở đây...
 def send_otp_via_medicare(sdt):
     return True  # Tạm thời return True
@@ -3625,7 +3624,7 @@ def start(message: Message):
     username = message.from_user.username or message.from_user.first_name
     
     # Cập nhật thông tin user nếu có database
-    if users_collection:
+    if users_collection is not None:
         users_collection.update_one(
             {'user_id': message.from_user.id},
             {'$set': {
@@ -3708,7 +3707,7 @@ def spam(message: Message):
         return
     
     # Kiểm tra bot có đang bật spam không
-    if bot_settings_collection:
+    if bot_settings_collection is not None:
         settings = bot_settings_collection.find_one({})
         if settings and not settings.get('spam_enabled', True):
             bot.reply_to(message, "⏸️ Tính năng spam tạm thời bị tắt bởi admin")
@@ -3741,7 +3740,7 @@ def my_stats(message: Message):
     user_info = get_user_info(user_id)
     
     today_spam = 0
-    if spam_logs_collection:
+    if spam_logs_collection is not None:
         start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         today_spam = spam_logs_collection.count_documents({
             'user_id': user_id,
@@ -3749,7 +3748,7 @@ def my_stats(message: Message):
         })
     
     max_per_day = 10
-    if bot_settings_collection:
+    if bot_settings_collection is not None:
         settings = bot_settings_collection.find_one({})
         if settings:
             max_per_day = settings.get('max_spam_per_day', 10)
@@ -3784,7 +3783,7 @@ def admin_panel(message: Message):
     
     # Lấy thông tin admin
     admin_count = 0
-    if bot_settings_collection:
+    if bot_settings_collection is not None:
         settings = bot_settings_collection.find_one({})
         if settings:
             admin_count = len(settings.get('admin_ids', []))
@@ -3818,11 +3817,11 @@ def admin_stats(message: Message):
     banned_users = 0
     spam_last_24h = 0
     
-    if users_collection:
+    if users_collection is not None:
         total_users = users_collection.count_documents({})
         banned_users = users_collection.count_documents({'is_banned': True})
     
-    if spam_logs_collection:
+    if spam_logs_collection is not None:
         total_spam_logs = spam_logs_collection.count_documents({})
         last_24h = datetime.now() - timedelta(hours=24)
         spam_last_24h = spam_logs_collection.count_documents({'timestamp': {'$gte': last_24h}})
@@ -3835,7 +3834,7 @@ def admin_stats(message: Message):
 📨 Tổng log spam: {total_spam_logs}
 ⏰ Spam 24h qua: {spam_last_24h}
 🔄 Task đang chạy: {len(spam_tasks)}
-💾 Database: {'✅ Kết nối' if db else '❌ Không kết nối'}
+💾 Database: {'✅ Kết nối' if db is not None else '❌ Không kết nối'}
     """
     bot.reply_to(message, stats_text)
 
@@ -3844,7 +3843,7 @@ def list_users(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not users_collection:
+    if users_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -3864,7 +3863,11 @@ def list_users(message: Message):
     users_text = f"👥 DANH SÁCH NGƯỜI DÙNG (Trang {page}):\n\n"
     for user in users:
         status = "🚫" if user.get('is_banned') else "✅"
-        admin_status = "👑" if user['user_id'] in (bot_settings_collection.find_one({}) or {}).get('admin_ids', []) else ""
+        admin_status = ""
+        if bot_settings_collection is not None:
+            settings = bot_settings_collection.find_one({})
+            if settings and user['user_id'] in settings.get('admin_ids', []):
+                admin_status = "👑"
         users_text += f"{status}{admin_status} ID: {user['user_id']}\n"
         if user.get('username'):
             users_text += f"   @{user['username']}\n"
@@ -3883,7 +3886,7 @@ def view_logs(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not spam_logs_collection:
+    if spam_logs_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -3901,7 +3904,9 @@ def view_logs(message: Message):
     
     logs_text = f"📋 LOG SPAM CHO {phone}:\n\n"
     for log in logs:
-        user_info = users_collection.find_one({'user_id': log['user_id']}) if users_collection else None
+        user_info = None
+        if users_collection is not None:
+            user_info = users_collection.find_one({'user_id': log['user_id']})
         username = user_info.get('username', 'N/A') if user_info else 'N/A'
         status = "✅" if log.get('success') else "❌"
         logs_text += f"{status} {log['timestamp'].strftime('%H:%M %d/%m/%Y')}\n"
@@ -3919,7 +3924,7 @@ def ban_user(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not users_collection:
+    if users_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -3954,7 +3959,7 @@ def unban_user(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not users_collection:
+    if users_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -3984,7 +3989,7 @@ def add_admin(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not bot_settings_collection:
+    if bot_settings_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -4028,7 +4033,7 @@ def remove_admin(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not bot_settings_collection:
+    if bot_settings_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -4089,7 +4094,7 @@ def toggle_spam(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not bot_settings_collection:
+    if bot_settings_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -4123,7 +4128,7 @@ def broadcast_message(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    if not users_collection:
+    if users_collection is None:
         bot.reply_to(message, "❌ Không có kết nối database!")
         return
     
@@ -4155,17 +4160,19 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return """
+    db_status = '✅ Kết nối' if db is not None else '❌ Không kết nối'
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Spam SMS Bot</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-            .online { background: #d4edda; color: #155724; }
-            .offline { background: #f8d7da; color: #721c24; }
+            body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+            .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            .status {{ padding: 10px; border-radius: 5px; margin: 10px 0; font-weight: bold; }}
+            .online {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
+            .stats {{ background: #e2e3e5; padding: 15px; border-radius: 5px; margin: 20px 0; }}
+            .button {{ display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; margin: 10px 5px; }}
         </style>
     </head>
     <body>
@@ -4174,12 +4181,17 @@ def home():
             <div class="status online">
                 ✅ Bot đang hoạt động
             </div>
-            <p><strong>📊 Thống kê:</strong></p>
-            <ul>
-                <li>Database: {'✅ Kết nối' if db else '❌ Không kết nối'}</li>
-                <li>Task đang chạy: {len(spam_tasks)}</li>
-            </ul>
-            <p><strong>📞 Liên hệ:</strong> @quocchienn</p>
+            <div class="stats">
+                <p><strong>📊 Thống kê:</strong></p>
+                <ul>
+                    <li>Database: {db_status}</li>
+                    <li>Task đang chạy: {len(spam_tasks)}</li>
+                    <li>Bot Uptime: Đang chạy...</li>
+                </ul>
+            </div>
+            <p><strong>📞 Liên hệ admin:</strong> @quocchienn</p>
+            <a href="/stats" class="button">API Stats</a>
+            <a href="https://t.me/spamsms_bot" class="button" style="background: #0088cc;">Telegram Bot</a>
         </div>
     </body>
     </html>
@@ -4188,15 +4200,16 @@ def home():
 @app.route('/stats')
 def web_stats():
     """API xem thống kê"""
-    total_users = users_collection.count_documents({}) if users_collection else 0
-    total_spam = spam_logs_collection.count_documents({}) if spam_logs_collection else 0
+    total_users = users_collection.count_documents({}) if users_collection is not None else 0
+    total_spam = spam_logs_collection.count_documents({}) if spam_logs_collection is not None else 0
     
     return {
         'status': 'online',
+        'timestamp': datetime.now().isoformat(),
         'total_users': total_users,
         'total_spam_requests': total_spam,
         'active_tasks': len(spam_tasks),
-        'database_connected': bool(db)
+        'database_connected': db is not None
     }
 
 def run_bot():
@@ -4225,7 +4238,7 @@ if __name__ == '__main__':
         print("⚠️ Cảnh báo: Không có ADMIN_IDS")
     
     # Kiểm tra admin
-    if bot_settings_collection:
+    if bot_settings_collection is not None:
         settings = bot_settings_collection.find_one({})
         if settings:
             admin_ids = settings.get('admin_ids', [])
