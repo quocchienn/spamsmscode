@@ -3242,9 +3242,10 @@ def run(phone, i):
         sleep(1)
 
 # Phần bot Telegram
-TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # Thay bằng token từ BotFather
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')  # Thay dòng TOKEN hardcode bằng dòng này
+if not TOKEN or ':' not in TOKEN:
+    raise ValueError("Invalid or missing TELEGRAM_BOT_TOKEN environment variable")
 bot = telebot.TeleBot(TOKEN)
-
 @bot.message_handler(commands=['start'])
 def start(message: Message):
     bot.reply_to(message, "Chào! Sử dụng /spam <số điện thoại> <số lần> để bắt đầu.")
