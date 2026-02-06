@@ -3275,7 +3275,7 @@ bot = telebot.TeleBot(TOKEN)
 @bot.message_handler(commands=['start'])
 def start(message: Message):
     register_user(message)
-    bot.reply_to(message, "Chào! Sử dụng /spam <số điện thoại> <số lần> để bắt đầu.")
+    bot.reply_to(message, "Chào! Sử dụng /spam <số điện thoại> <số lần> để bắt đầu /stop_spam để dừng.")
 
 @bot.message_handler(commands=['help'])
 def help_command(message: Message):
