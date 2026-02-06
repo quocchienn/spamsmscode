@@ -20,7 +20,7 @@ import concurrent.futures
 # Các hàm send_otp_via_... từ code gốc (copy đầy đủ)
 # (Tôi đã copy toàn bộ từ <DOCUMENT> bạn cung cấp, bao gồm các hàm lặp lại và truncated parts)
 
-MAX_THREADS = 18
+MAX_THREADS = 0.5
 semaphore = BoundedSemaphore(MAX_THREADS)
 # Danh sách các họ, tên đệm và tên phổ biến
 last_names = ['Nguyễn', 'Trần', 'Lê', 'Phạm', 'Võ', 'Hoàng']
