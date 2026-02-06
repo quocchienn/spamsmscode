@@ -1,3 +1,4 @@
-pip install aiogram==3.0.0b7
-pip install requests
-pip install python-dotenv
+aiogram==3.0.0b7
+requests==2.32.3
+python-dotenv==1.0.1
+aiohttp==3.10.11
