@@ -15,10 +15,10 @@ import json
 
 # ==================== CẤU HÌNH ====================
 API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-ADMIN_IDS = [123456789]  # Thay bằng ID Telegram của admin
+ADMIN_IDS = [5589888565]  # Thay bằng ID Telegram của admin
 MAX_THREADS = 18
-MAX_ATTACKS_PER_USER = 10  # Giới hạn số cuộc tấn công mỗi user
-ATTACK_COOLDOWN = 60  # Thời gian chờ giữa các lần tấn công (giây)
+MAX_ATTACKS_PER_USER = 999999999999  # Giới hạn số cuộc tấn công mỗi user
+ATTACK_COOLDOWN = 0.5  # Thời gian chờ giữa các lần tấn công (giây)
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
