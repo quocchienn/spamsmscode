@@ -21,9 +21,12 @@ from pymongo import MongoClient
 from threading import Event
 
 # Kết nối MongoDB
-MONGO_URI = "MONGO_URI"
+MONGO_URI = os.environ.get("MONGODB_URI")
+if not MONGO_URI:
+    raise ValueError("Không tìm thấy biến môi trường MONGODB_URI. Vui lòng thiết lập trên Render Dashboard.")
+
 client = MongoClient(MONGO_URI)
-db = client['spam_bot']
+db = client['spam_bot']  # hoặc tên database bạn muốn
 spams_collection = db['spams']
 users_collection = db['users']
 
