@@ -12,7 +12,9 @@ import random
 import string
 import requests
 import json
-
+import os
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 # ==================== CẤU HÌNH ====================
 API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
 ADMIN_IDS = [5589888565]  # Thay bằng ID Telegram của admin
@@ -3677,6 +3679,20 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Thay vì asyncio.run(main())
-    import asyncio
-    asyncio.run(main())
+    # Kiểm tra nếu chạy trên Render (có PORT)
+    if os.getenv("RENDER"):
+        app = web.Application()
+        webhook_path = f"/{API_TOKEN}"
+        
+        SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+        ).register(app, path=webhook_path)
+        
+        setup_application(app, dp, bot=bot)
+        
+        PORT = int(os.getenv("PORT", 10000))
+        web.run_app(app, host="0.0.0.0", port=PORT)
+    else:
+        # Chạy local với polling
+        asyncio.run(main())
