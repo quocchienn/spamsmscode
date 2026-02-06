@@ -1,20 +1,18 @@
+import os
 import asyncio
 import logging
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils import executor
 import threading
 import random
 import string
 import requests
 import json
-import os
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from dotenv import load_dotenv
 # ==================== CẤU HÌNH ====================
 API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
 ADMIN_IDS = [5589888565]  # Thay bằng ID Telegram của admin
@@ -3668,31 +3666,5 @@ async def error_handler(event: types.ErrorEvent):
         pass
 
 # ==================== MAIN FUNCTION ====================
-async def main():
-    """Hàm chính"""
-    logger.info("🤖 Khởi động SMS Bomber Bot...")
-    
-    # Xóa webhook cũ
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Khởi động bot
-    await dp.start_polling(bot)
-
 if __name__ == "__main__":
-    # Kiểm tra nếu chạy trên Render (có PORT)
-    if os.getenv("RENDER"):
-        app = web.Application()
-        webhook_path = f"/{API_TOKEN}"
-        
-        SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-        ).register(app, path=webhook_path)
-        
-        setup_application(app, dp, bot=bot)
-        
-        PORT = int(os.getenv("PORT", 10000))
-        web.run_app(app, host="0.0.0.0", port=PORT)
-    else:
-        # Chạy local với polling
-        asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True)
