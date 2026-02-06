@@ -43,12 +43,12 @@ MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 DATABASE_NAME = 'otp_spam_bot'
 
 # TỐI ƯU: Tăng số lượng thread và connection
-MAX_THREADS = int(os.getenv('MAX_THREADS', MAX_THREADS = int(os.getenv('MAX_THREADS', 20000000000000))  # Tăng từ 50 lên 200
-MAX_CONCURRENT_REQUESTS = int(os.getenv'MAX_CONCURRENT_REQUESTS', 1000000000))  # Số request đồng thời
+MAX_THREADS = int(os.getenv('MAX_THREADS', 200))  # Tăng từ 50 lên 200
+MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', 100))  # Số request đồng thời
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 10))  # Timeout ngắn hơn
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', 2))  # Giảm retry để tăng tốc
 
-MAX_SPAM_PER_PHONE = int(os.getenv('MAX_SPAM_PER_PHONE', 200000000))  # Tăng giới hạn
+MAX_SPAM_PER_PHONE = int(os.getenv('MAX_SPAM_PER_PHONE', 200))  # Tăng giới hạn
 SPAM_COOLDOWN_HOURS = int(os.getenv('SPAM_COOLDOWN_HOURS', 1))  # Giảm cooldown
 
 # TỐI ƯU: Session pool cho requests
