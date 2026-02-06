@@ -1,5 +1,7 @@
 pyTelegramBotAPI
-flask
+Flask
+pymongo
 requests
-colorama
-pymongo[srv]
+aiohttp
+async-timeout
+urllib3
