@@ -26,9 +26,9 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise ValueError("Không tìm thấy BOT_TOKEN trong biến môi trường!")
 
-ADMIN_IDS = [123456789]  # Thay bằng ID Telegram của admin
-MAX_ATTACKS_PER_USER = 10
-ATTACK_COOLDOWN = 60
+ADMIN_IDS = [5589888565]  # Thay bằng ID Telegram của admin
+MAX_ATTACKS_PER_USER = 100000000
+ATTACK_COOLDOWN = 0.5
 
 # ==================== LOGGING ====================
 logging.basicConfig(
