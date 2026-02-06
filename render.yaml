@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: otp-spam-ultra
+    name: otp-spam-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
@@ -9,14 +9,14 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+        optional: true
       - key: MONGODB_URI
         sync: false
+        optional: true
       - key: MAX_THREADS
-        value: "200"
-      - key: MAX_CONCURRENT_REQUESTS
         value: "100"
+      - key: MAX_CONCURRENT_REQUESTS
+        value: "50"
       - key: REQUEST_TIMEOUT
         value: "5"
-      - key: MAX_RETRIES
-        value: "1"
-    plan: pro  # Sử dụng plan Pro để có nhiều CPU/RAM hơn
+    plan: starter  # Hoặc pro nếu cần nhiều tài nguyên hơn
