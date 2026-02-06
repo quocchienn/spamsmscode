@@ -1,5 +1,5 @@
 import telebot
-from telebot.types import Message
+from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request
 import threading
 import os
@@ -18,75 +18,186 @@ from threading import BoundedSemaphore
 import concurrent.futures
 from pymongo import MongoClient
 from bson import ObjectId
-from datetime import datetime
+import logging
+from functools import wraps
 
-# ====================== CẤU HÌNH MONGODB ======================
-# Lấy MongoDB URI từ biến môi trường Render
-MONGODB_URI = os.environ.get('MONGODB_URI')
-# Lấy ADMIN_IDS từ biến môi trường (ví dụ: "123456789,987654321")
-ADMIN_IDS = os.environ.get('ADMIN_IDS', '')
+# ==============================
+# CẤU HÌNH VÀ KHỞI TẠO
+# ==============================
 
-# Khởi tạo kết nối MongoDB
-db = None
-users_collection = None
-spam_logs_collection = None
-bot_settings_collection = None
+# Cấu hình
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+DATABASE_NAME = 'otp_spam_bot'
+MAX_THREADS = int(os.getenv('MAX_THREADS', 50))
+MAX_SPAM_PER_PHONE = int(os.getenv('MAX_SPAM_PER_PHONE', 100))
+SPAM_COOLDOWN_HOURS = int(os.getenv('SPAM_COOLDOWN_HOURS', 24))
 
-if MONGODB_URI:
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=10000)
-        # Test kết nối
-        client.admin.command('ping')
-        print("✅ Kết nối MongoDB thành công!")
-        db = client['telegram_bot_db']
-        
-        # Các collections
-        users_collection = db['users']
-        spam_logs_collection = db['spam_logs']
-        bot_settings_collection = db['bot_settings']
-        
-        # Tạo index
-        users_collection.create_index([('user_id', 1)], unique=True)
-        spam_logs_collection.create_index([('timestamp', -1)])
-        spam_logs_collection.create_index([('phone_number', 1)])
-        
-        # Khởi tạo cài đặt bot nếu chưa có
-        if bot_settings_collection.count_documents({}) == 0:
-            admin_ids_list = []
-            if ADMIN_IDS:
-                admin_ids_list = [int(uid.strip()) for uid in ADMIN_IDS.split(',') if uid.strip().isdigit()]
-            
-            bot_settings_collection.insert_one({
-                'spam_enabled': True,
-                'admin_ids': admin_ids_list,
-                'max_spam_per_day': 10,
-                'created_at': datetime.now()
-            })
-            print(f"✅ Đã tạo cài đặt bot với admin IDs: {admin_ids_list}")
-            
-    except Exception as e:
-        print(f"❌ Lỗi kết nối MongoDB: {e}")
-        print("⚠️ Bot sẽ chạy mà không có database...")
-else:
-    print("⚠️ Không tìm thấy MONGODB_URI trong biến môi trường")
-    print("⚠️ Bot sẽ chạy mà không có database...")
-
-# ====================== BIẾN TOÀN CỤC ======================
-spam_tasks = {}  # Lưu trữ các task spam đang chạy {chat_id: task}
-MAX_THREADS = 0.5
+# Khởi tạo
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 semaphore = BoundedSemaphore(MAX_THREADS)
 
+# Khởi tạo MongoDB
+client = MongoClient(MONGODB_URI)
+db = client[DATABASE_NAME]
+users_collection = db['users']
+spam_history_collection = db['spam_history']
+blocked_phones_collection = db['blocked_phones']
+admin_settings_collection = db['admin_settings']
+
+# Biến toàn cục
+is_spamming_active = True
+active_spams = {}
+
+# ==============================
+# DECORATORS VÀ TIỆN ÍCH
+# ==============================
+
+def admin_only(func):
+    """Decorator chỉ cho phép admin sử dụng command"""
+    @wraps(func)
+    def wrapper(message, *args, **kwargs):
+        if message.from_user.id not in ADMIN_IDS:
+            bot.reply_to(message, "❌ Bạn không có quyền sử dụng lệnh này!")
+            return
+        return func(message, *args, **kwargs)
+    return wrapper
+
+def format_phone_number(phone):
+    """Chuẩn hóa số điện thoại"""
+    phone = str(phone).strip()
+    if phone.startswith('0'):
+        phone = '84' + phone[1:]
+    elif phone.startswith('+84'):
+        phone = phone[1:]
+    elif not phone.startswith('84'):
+        phone = '84' + phone
+    return phone
+
+def log_spam_activity(user_id, phone, service_name, status):
+    """Ghi log hoạt động spam vào database"""
+    log_entry = {
+        'user_id': user_id,
+        'phone': format_phone_number(phone),
+        'service_name': service_name,
+        'status': status,
+        'timestamp': datetime.now(),
+        'ip_address': request.remote_addr if request else None
+    }
+    spam_history_collection.insert_one(log_entry)
+    
+    # Cập nhật tổng số lần spam của số điện thoại
+    update_phone_spam_count(phone)
+
+def update_phone_spam_count(phone):
+    """Cập nhật số lần spam của một số điện thoại"""
+    phone = format_phone_number(phone)
+    
+    # Lấy thông tin hiện tại
+    phone_info = users_collection.find_one({'phone': phone})
+    
+    if phone_info:
+        new_count = phone_info.get('spam_count', 0) + 1
+        users_collection.update_one(
+            {'phone': phone},
+            {'$set': {'spam_count': new_count, 'last_spam': datetime.now()}}
+        )
+        
+        # Nếu vượt quá giới hạn, tự động block
+        if new_count >= MAX_SPAM_PER_PHONE:
+            block_phone(phone, f"Tự động block: Đạt giới hạn {MAX_SPAM_PER_PHONE} lần spam")
+    else:
+        users_collection.insert_one({
+            'phone': phone,
+            'spam_count': 1,
+            'first_spam': datetime.now(),
+            'last_spam': datetime.now(),
+            'is_blocked': False
+        })
+
+def block_phone(phone, reason="Vượt quá giới hạn spam"):
+    """Block một số điện thoại"""
+    phone = format_phone_number(phone)
+    
+    blocked_phones_collection.update_one(
+        {'phone': phone},
+        {
+            '$set': {
+                'phone': phone,
+                'blocked_at': datetime.now(),
+                'reason': reason,
+                'is_active': True
+            }
+        },
+        upsert=True
+    )
+    
+    users_collection.update_one(
+        {'phone': phone},
+        {'$set': {'is_blocked': True, 'block_reason': reason}}
+    )
+
+def unblock_phone(phone):
+    """Gỡ block một số điện thoại"""
+    phone = format_phone_number(phone)
+    
+    blocked_phones_collection.update_one(
+        {'phone': phone},
+        {'$set': {'is_active': False, 'unblocked_at': datetime.now()}}
+    )
+    
+    users_collection.update_one(
+        {'phone': phone},
+        {'$set': {'is_blocked': False, 'block_reason': None}}
+    )
+
+def is_phone_blocked(phone):
+    """Kiểm tra số điện thoại có bị block không"""
+    phone = format_phone_number(phone)
+    
+    blocked = blocked_phones_collection.find_one({
+        'phone': phone,
+        'is_active': True
+    })
+    
+    return blocked is not None
+
+def check_spam_cooldown(phone):
+    """Kiểm tra thời gian chờ giữa các lần spam"""
+    phone = format_phone_number(phone)
+    
+    phone_info = users_collection.find_one({'phone': phone})
+    if not phone_info or 'last_spam' not in phone_info:
+        return True
+    
+    last_spam = phone_info['last_spam']
+    if isinstance(last_spam, str):
+        last_spam = datetime.fromisoformat(last_spam)
+    
+    time_diff = datetime.now() - last_spam
+    return time_diff.total_seconds() > SPAM_COOLDOWN_HOURS * 3600
+
+MAX_THREADS = 0.5
+semaphore = BoundedSemaphore(MAX_THREADS)
 # Danh sách các họ, tên đệm và tên phổ biến
 last_names = ['Nguyễn', 'Trần', 'Lê', 'Phạm', 'Võ', 'Hoàng']
 middle_names = ['Vân', 'Thị', 'Quang', 'Hoàng', 'Anh', 'Thanh']
 first_names = ['Nam', 'Tuấn', 'Hương', 'Linh', 'Long', 'Duy']
 
-# ====================== HÀM TIỆN ÍCH ======================
+# Tạo tên ngẫu nhiên
 def generate_random_name():
     last_name = random.choice(last_names)
-    middle_name = random.choice(middle_names) if random.choice([True, False]) else ''
+    middle_name = random.choice(middle_names) if random.choice([True, False]) else ''  # Optional middle name
     first_name = random.choice(first_names)
     return f"{last_name} {middle_name} {first_name}".strip()
+
+def generate_random_id():
+    def random_segment(length):
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+    
+    return f"{random_segment(2)}7D7{random_segment(1)}6{random_segment(1)}E-D52E-46EA-8861-ED{random_segment(1)}BB{random_segment(2)}86{random_segment(3)}"
 
 def generate_random_id():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
@@ -94,85 +205,9 @@ def generate_random_id():
 def format_device_id(device_id):
     return f"{device_id[:8]}-{device_id[8:12]}-{device_id[12:16]}-{device_id[16:20]}-{device_id[20:]}"
 
-def is_admin(user_id):
-    """Kiểm tra xem user có phải admin không"""
-    if bot_settings_collection is None:
-        return False
-    
-    settings = bot_settings_collection.find_one({})
-    if not settings:
-        return False
-    
-    return user_id in settings.get('admin_ids', [])
+random_id = generate_random_id()
+formatted_device_id = format_device_id(random_id)
 
-def get_user_info(user_id):
-    """Lấy thông tin user từ database hoặc tạo mới"""
-    if users_collection is None:
-        return {
-            'user_id': user_id,
-            'username': '',
-            'first_name': '',
-            'last_name': '',
-            'spam_count': 0,
-            'last_spam': None,
-            'created_at': datetime.now(),
-            'is_banned': False
-        }
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        user = {
-            'user_id': user_id,
-            'username': '',
-            'first_name': '',
-            'last_name': '',
-            'spam_count': 0,
-            'last_spam': None,
-            'created_at': datetime.now(),
-            'is_banned': False
-        }
-        users_collection.insert_one(user)
-    return user
-
-def log_spam_action(user_id, phone_number, count, success=True):
-    """Ghi log spam vào database"""
-    if spam_logs_collection is not None:
-        log_entry = {
-            'user_id': user_id,
-            'phone_number': phone_number,
-            'count': count,
-            'timestamp': datetime.now(),
-            'success': success
-        }
-        spam_logs_collection.insert_one(log_entry)
-    
-    # Cập nhật số lần spam của user
-    if users_collection is not None:
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$inc': {'spam_count': count}, '$set': {'last_spam': datetime.now()}}
-        )
-
-def check_spam_limit(user_id):
-    """Kiểm tra giới hạn spam trong ngày"""
-    if bot_settings_collection is None or spam_logs_collection is None:
-        return True  # Nếu không có DB, không giới hạn
-    
-    settings = bot_settings_collection.find_one({})
-    if not settings:
-        return True
-    
-    max_per_day = settings.get('max_spam_per_day', 10)
-    
-    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_spam = spam_logs_collection.count_documents({
-        'user_id': user_id,
-        'timestamp': {'$gte': start_of_day}
-    })
-    
-    return today_spam < max_per_day
-
-# ====================== CÁC HÀM SEND OTP (GIỮ NGUYÊN) ======================
 def send_otp_via_sapo(sdt):
     cookies = {
         'landing_page': 'https://www.sapo.vn/',
@@ -3324,931 +3359,890 @@ def send_otp_via_takomo(sdt):
 ##################################################################################################################################################################################
 
 ##################################################################################################################################################################################
-# Thêm các hàm OTP khác ở đây...
-def send_otp_via_medicare(sdt):
-    return True  # Tạm thời return True
 
-def send_otp_via_tv360(sdt):
-    return True
 
-def send_otp_via_dienmayxanh(sdt):
-    return True
-
-def send_otp_via_kingfoodmart(sdt):
-    return True
-
-def send_otp_via_mocha(sdt):
-    return True
-
-def send_otp_via_fptdk(sdt):
-    return True
-
-def send_otp_via_fptmk(sdt):
-    return True
-
-def send_otp_via_VIEON(sdt):
-    return True
-
-def send_otp_via_ghn(sdt):
-    return True
-
-def send_otp_via_lottemart(sdt):
-    return True
-
-def send_otp_via_DONGCRE(sdt):
-    return True
-
-def send_otp_via_shopee(sdt):
-    return True
-
-def send_otp_via_TGDD(sdt):
-    return True
-
-def send_otp_via_fptshop(sdt):
-    return True
-
-def send_otp_via_WinMart(sdt):
-    return True
-
-def send_otp_via_vietloan(sdt):
-    return True
-
-def send_otp_via_lozi(sdt):
-    return True
-
-def send_otp_via_F88(sdt):
-    return True
-
-def send_otp_via_spacet(sdt):
-    return True
-
-def send_otp_via_vinpearl(sdt):
-    return True
-
-def send_otp_via_traveloka(sdt):
-    return True
-
-def send_otp_via_dongplus(sdt):
-    return True
-
-def send_otp_via_longchau(sdt):
-    return True
-
-def send_otp_via_longchau1(sdt):
-    return True
-
-def send_otp_via_galaxyplay(sdt):
-    return True
-
-def send_otp_via_emartmall(sdt):
-    return True
-
-def send_otp_via_ahamove(sdt):
-    return True
-
-def send_otp_via_ViettelMoney(sdt):
-    return True
-
-def send_otp_via_xanhsmsms(sdt):
-    return True
-
-def send_otp_via_xanhsmzalo(sdt):
-    return True
-
-def send_otp_via_popeyes(sdt):
-    return True
-
-def send_otp_via_ACHECKIN(sdt):
-    return True
-
-def send_otp_via_APPOTA(sdt):
-    return True
-
-def send_otp_via_Watsons(sdt):
-    return True
-
-def send_otp_via_hoangphuc(sdt):
-    return True
-
-def send_otp_via_fmcomvn(sdt):
-    return True
-
-def send_otp_via_Reebokvn(sdt):
-    return True
-
-def send_otp_via_thefaceshop(sdt):
-    return True
-
-def send_otp_via_BEAUTYBOX(sdt):
-    return True
-
-def send_otp_via_futabus(sdt):
-    return True
-
-def send_otp_via_ViettelPost(sdt):
-    return True
-
-def send_otp_via_myviettel2(sdt):
-    return True
-
-def send_otp_via_myviettel3(sdt):
-    return True
-
-def send_otp_via_TOKYOLIFE(sdt):
-    return True
-
-def send_otp_via_30shine(sdt):
-    return True
-
-def send_otp_via_Cathaylife(sdt):
-    return True
-
-def send_otp_via_dominos(sdt):
-    return True
-
-def send_otp_via_vinamilk(sdt):
-    return True
-
-def send_otp_via_vietloan2(sdt):
-    return True
-
-def send_otp_via_batdongsan(sdt):
-    return True
-
-def send_otp_via_GUMAC(sdt):
-    return True
-
-def send_otp_via_mutosi(sdt):
-    return True
-
-def send_otp_via_mutosi1(sdt):
-    return True
-
-def send_otp_via_vietair(sdt):
-    return True
-
-def send_otp_via_FAHASA(sdt):
-    return True
-
-def send_otp_via_hopiness(sdt):
-    return True
-
-def send_otp_via_modcha35(sdt):
-    return True
-
-def send_otp_via_Bibabo(sdt):
-    return True
-
-def send_otp_via_MOCA(sdt):
-    return True
-
-def send_otp_via_pantio(sdt):
-    return True
-
-def send_otp_via_Routine(sdt):
-    return True
-
-def send_otp_via_vayvnd(sdt):
-    return True
-
-def send_otp_via_tima(sdt):
-    return True
-
-def send_otp_via_moneygo(sdt):
-    return True
-
-def send_otp_via_takomo(sdt):
-    return True
-
-def send_otp_via_paynet(sdt):
-    return True
-
-def send_otp_via_pico(sdt):
-    return True
-
-def send_otp_via_PNJ(sdt):
-    return True
-
-def send_otp_via_TINIWORLD(sdt):
-    return True
-
-# ====================== HÀM RUN SPAM (CẬP NHẬT) ======================
-def run_spam(phone, count, chat_id, user_id):
-    """Hàm thực hiện spam với khả năng dừng"""
-    task_id = f"{chat_id}_{int(time.time())}"
-    spam_tasks[task_id] = {
-        'running': True,
-        'current_count': 0,
-        'total_count': count,
-        'phone': phone
-    }
-    
-    try:
-        for i in range(1, count + 1):
-            if not spam_tasks.get(task_id, {}).get('running', True):
-                bot.send_message(chat_id, f"🚫 Đã dừng spam cho số {phone}")
-                break
-            
-            spam_tasks[task_id]['current_count'] = i
-            
-            # Gọi các hàm spam
-            functions = [
-                send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
-                send_otp_via_dienmayxanh, send_otp_via_kingfoodmart, send_otp_via_mocha, send_otp_via_fptdk,
-                send_otp_via_fptmk, send_otp_via_VIEON, send_otp_via_ghn, send_otp_via_lottemart,
-                send_otp_via_DONGCRE, send_otp_via_shopee, send_otp_via_TGDD, send_otp_via_fptshop,
-                send_otp_via_WinMart, send_otp_via_vietloan, send_otp_via_lozi, send_otp_via_F88,
-                send_otp_via_spacet, send_otp_via_vinpearl, send_otp_via_traveloka, send_otp_via_dongplus,
-                send_otp_via_longchau, send_otp_via_longchau1, send_otp_via_galaxyplay, send_otp_via_emartmall,
-                send_otp_via_ahamove, send_otp_via_ViettelMoney, send_otp_via_xanhsmsms, send_otp_via_xanhsmzalo,
-                send_otp_via_popeyes, send_otp_via_ACHECKIN, send_otp_via_APPOTA, send_otp_via_Watsons,
-                send_otp_via_hoangphuc, send_otp_via_fmcomvn, send_otp_via_Reebokvn, send_otp_via_thefaceshop,
-                send_otp_via_BEAUTYBOX, send_otp_via_winmart, send_otp_via_medicare, send_otp_via_futabus,
-                send_otp_via_ViettelPost, send_otp_via_myviettel2, send_otp_via_myviettel3, send_otp_via_TOKYOLIFE,
-                send_otp_via_30shine, send_otp_via_Cathaylife, send_otp_via_dominos, send_otp_via_vinamilk,
-                send_otp_via_vietloan2, send_otp_via_batdongsan, send_otp_via_GUMAC, send_otp_via_mutosi,
-                send_otp_via_mutosi1, send_otp_via_vietair, send_otp_via_FAHASA, send_otp_via_hopiness,
-                send_otp_via_modcha35, send_otp_via_Bibabo, send_otp_via_MOCA, send_otp_via_pantio,
-                send_otp_via_Routine, send_otp_via_vayvnd, send_otp_via_tima, send_otp_via_moneygo,
-                send_otp_via_takomo, send_otp_via_paynet, send_otp_via_pico, send_otp_via_PNJ, send_otp_via_TINIWORLD,
-            ]
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-                futures = [executor.submit(fn, phone) for fn in functions]
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        print(f'Đã xảy ra lỗi: {exc}')
-            
-            print(f"Spam thành công lần {i}/{count} cho {phone}")
-            
-            # Cập nhật tiến độ mỗi 5 lần
-            if i % 5 == 0:
-                bot.send_message(chat_id, f"📊 Tiến độ: {i}/{count} lần đã hoàn thành")
-            
-            if i < count:
-                for j in range(4, 0, -1):
-                    if not spam_tasks.get(task_id, {}).get('running', True):
-                        break
-                    sleep(1)
-        
-        # Ghi log sau khi hoàn thành
-        if spam_tasks.get(task_id, {}).get('running', True):
-            log_spam_action(user_id, phone, count, success=True)
-            bot.send_message(chat_id, f"✅ Hoàn thành spam {count} lần cho số {phone}")
-        else:
-            completed = spam_tasks[task_id]['current_count']
-            log_spam_action(user_id, phone, completed, success=False)
-    
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ Lỗi khi spam: {str(e)}")
-        completed = spam_tasks.get(task_id, {}).get('current_count', 0)
-        log_spam_action(user_id, phone, completed, success=False)
-    
-    finally:
-        if task_id in spam_tasks:
-            del spam_tasks[task_id]
-
-# ====================== BOT TELEGRAM ======================
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-if not TOKEN or ':' not in TOKEN:
-    print("❌ Lỗi: Thiếu TELEGRAM_BOT_TOKEN trong biến môi trường!")
-    sys.exit(1)
-
-bot = telebot.TeleBot(TOKEN)
-
-@bot.message_handler(commands=['start'])
-def start(message: Message):
-    user_info = get_user_info(message.from_user.id)
-    username = message.from_user.username or message.from_user.first_name
-    
-    # Cập nhật thông tin user nếu có database
-    if users_collection is not None:
-        users_collection.update_one(
-            {'user_id': message.from_user.id},
-            {'$set': {
-                'username': username,
-                'first_name': message.from_user.first_name or '',
-                'last_name': message.from_user.last_name or ''
-            }},
-            upsert=True
-        )
-    
-    welcome_text = f"""
-👋 Chào {message.from_user.first_name}!
-
-📱 Sử dụng lệnh:
+import concurrent.futures  # Import module cần thiết
+import time
+
+# ... (các hàm send_otp_via_... đã được định nghĩa ở trên)
+
+def run(phone, i):
+    functions = [
+        send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
+        send_otp_via_dienmayxanh, send_otp_via_kingfoodmart, send_otp_via_mocha, send_otp_via_fptdk,
+        send_otp_via_fptmk, send_otp_via_VIEON, send_otp_via_ghn, send_otp_via_lottemart,
+        send_otp_via_DONGCRE, send_otp_via_shopee, send_otp_via_TGDD, send_otp_via_fptshop,
+        send_otp_via_WinMart, send_otp_via_vietloan, send_otp_via_lozi, send_otp_via_F88,
+        send_otp_via_spacet, send_otp_via_vinpearl, send_otp_via_traveloka, send_otp_via_dongplus,
+        send_otp_via_longchau, send_otp_via_longchau1, send_otp_via_galaxyplay, send_otp_via_emartmall,
+        send_otp_via_ahamove, send_otp_via_ViettelMoney, send_otp_via_xanhsmsms, send_otp_via_xanhsmzalo,
+        send_otp_via_popeyes, send_otp_via_ACHECKIN, send_otp_via_APPOTA, send_otp_via_Watsons,
+        send_otp_via_hoangphuc, send_otp_via_fmcomvn, send_otp_via_Reebokvn, send_otp_via_thefaceshop,
+        send_otp_via_BEAUTYBOX, send_otp_via_winmart, send_otp_via_medicare, send_otp_via_futabus,
+        send_otp_via_ViettelPost, send_otp_via_myviettel2, send_otp_via_myviettel3, send_otp_via_TOKYOLIFE,
+        send_otp_via_30shine, send_otp_via_Cathaylife, send_otp_via_dominos, send_otp_via_vinamilk,
+        send_otp_via_vietloan2, send_otp_via_batdongsan, send_otp_via_GUMAC, send_otp_via_mutosi,
+        send_otp_via_mutosi1, send_otp_via_vietair, send_otp_via_FAHASA, send_otp_via_hopiness,
+        send_otp_via_modcha35, send_otp_via_Bibabo, send_otp_via_MOCA, send_otp_via_pantio,
+        send_otp_via_Routine, send_otp_via_vayvnd, send_otp_via_tima, send_otp_via_moneygo,
+        send_otp_via_takomo, send_otp_via_paynet, send_otp_via_pico, send_otp_via_PNJ, send_otp_via_TINIWORLD,
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [executor.submit(fn, phone) for fn in functions]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                print(f'Đã xảy ra lỗi: {exc}')
+
+    print("Spam thành công lần :", i)
+    for j in range(4, 0, -1):
+        print(f"Vui lòng chờ {j} giây", end="\r")
+        sleep(1)
+
+# Phần bot Telegram
+
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    """Gửi hướng dẫn sử dụng bot"""
+    welcome_text = """
+🚀 *OTP Spam Bot* - Công cụ gửi OTP mạnh mẽ
+
+📋 *Các lệnh có sẵn:*
 /spam <số điện thoại> <số lần> - Gửi spam OTP
-/mystats - Xem thống kê của bạn
-/help - Xem hướng dẫn
+/status - Kiểm tra trạng thái bot
+/mystats - Thống kê của bạn
+/cancel - Hủy spam đang chạy
 
-🛑 Để dừng spam đang chạy: /stop
+👑 *Lệnh Admin:*
+/admin - Menu quản trị
+/stats - Thống kê tổng quan
+/users - Danh sách người dùng
+/phones - Danh sách số điện thoại
+/block <số> <lý do> - Block số điện thoại
+/unblock <số> - Gỡ block số điện thoại
+/active <on/off> - Bật/tắt bot
+/export - Xuất dữ liệu
 
-{'👑 Lệnh Admin: /admin' if is_admin(message.from_user.id) else ''}
+⚠️ *Lưu ý:* Chỉ sử dụng cho mục đích hợp pháp.
     """
-    bot.reply_to(message, welcome_text)
-
-@bot.message_handler(commands=['help'])
-def help_command(message: Message):
-    help_text = """
-📖 HƯỚNG DẪN SỬ DỤNG:
-
-1. Spam OTP:
-   /spam 0912345678 10
-
-2. Xem thống kê cá nhân:
-   /mystats
-
-3. Dừng spam đang chạy:
-   /stop
-
-4. Lệnh Admin (chỉ admin):
-   /admin - Menu admin
-   /stats - Thống kê tổng quan
-   /users - Danh sách người dùng
-   /logs <số điện thoại> - Xem log spam
-   /ban <user_id> - Cấm người dùng
-   /unban <user_id> - Bỏ cấm
-   /stopall - Dừng tất cả spam
-   /addadmin <user_id> - Thêm admin
-   /removeadmin <user_id> - Xóa admin
-    """
-    bot.reply_to(message, help_text)
+    
+    # Lưu thông tin user vào database
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    
+    users_collection.update_one(
+        {'user_id': user_id},
+        {
+            '$set': {
+                'username': username,
+                'first_name': first_name,
+                'last_name': last_name,
+                'last_active': datetime.now(),
+                'is_admin': user_id in ADMIN_IDS
+            },
+            '$setOnInsert': {
+                'join_date': datetime.now(),
+                'total_spam_requests': 0
+            }
+        },
+        upsert=True
+    )
+    
+    bot.reply_to(message, welcome_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['spam'])
-def spam(message: Message):
-    user_id = message.from_user.id
-    user_info = get_user_info(user_id)
+def handle_spam(message):
+    """Xử lý lệnh spam OTP"""
+    global is_spamming_active, active_spams
     
-    # Kiểm tra user có bị ban không
-    if user_info.get('is_banned', False):
-        bot.reply_to(message, "🚫 Tài khoản của bạn đã bị khóa!")
+    if not is_spamming_active:
+        bot.reply_to(message, "⏸️ Bot đang tạm dừng hoạt động. Vui lòng liên hệ admin!")
         return
     
-    # Kiểm tra giới hạn spam
-    if not check_spam_limit(user_id):
-        bot.reply_to(message, "⚠️ Bạn đã đạt giới hạn spam trong ngày hôm nay!")
-        return
-    
-    args = message.text.split()[1:]
-    if len(args) != 2:
-        bot.reply_to(message, "⚠️ Sai cú pháp. Ví dụ: /spam 0912345678 10")
-        return
-    
-    phone = args[0]
     try:
-        count = int(args[1])
-        if count <= 0 or count > 50:
-            bot.reply_to(message, "⚠️ Số lần phải từ 1 đến 50")
+        # Phân tích command
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /spam <số điện thoại> [số lần]")
             return
-    except ValueError:
-        bot.reply_to(message, "⚠️ Số lần phải là số nguyên")
+        
+        phone = parts[1]
+        count = 1
+        if len(parts) >= 3:
+            count = int(parts[2])
+            count = min(count, 50)  # Giới hạn tối đa 50 lần
+        
+        # Kiểm tra số điện thoại
+        phone = format_phone_number(phone)
+        
+        # Kiểm tra block
+        if is_phone_blocked(phone):
+            bot.reply_to(message, f"🚫 Số {phone} đã bị block. Không thể spam!")
+            return
+        
+        # Kiểm tra cooldown
+        if not check_spam_cooldown(phone):
+            phone_info = users_collection.find_one({'phone': phone})
+            last_spam = phone_info.get('last_spam')
+            if isinstance(last_spam, str):
+                last_spam = datetime.fromisoformat(last_spam)
+            
+            next_time = last_spam + timedelta(hours=SPAM_COOLDOWN_HOURS)
+            remaining = next_time - datetime.now()
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            
+            bot.reply_to(message, 
+                        f"⏳ Số {phone} đang trong thời gian chờ!\n"
+                        f"⏰ Có thể spam lại sau: {hours} giờ {minutes} phút")
+            return
+        
+        # Thông báo bắt đầu
+        msg = bot.reply_to(message, f"🔄 Đang khởi tạo spam cho {phone}...")
+        
+        # Lấy tất cả các hàm gửi OTP
+        otp_functions = [
+            func for name, func in globals().items() 
+            if name.startswith('send_otp_via_') and callable(func)
+        ]
+        
+        if not otp_functions:
+            bot.reply_to(message, "❌ Không tìm thấy hàm gửi OTP!")
+            return
+        
+        # Tạo thread spam
+        spam_id = f"{message.from_user.id}_{int(time.time())}"
+        active_spams[spam_id] = {
+            'user_id': message.from_user.id,
+            'phone': phone,
+            'count': count,
+            'started_at': datetime.now(),
+            'is_running': True
+        }
+        
+        # Chạy spam trong thread riêng
+        thread = threading.Thread(
+            target=run_spam,
+            args=(spam_id, phone, count, otp_functions, message.chat.id, msg.message_id)
+        )
+        thread.start()
+        
+        # Tạo nút hủy
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("❌ Hủy spam", callback_data=f"cancel_{spam_id}"))
+        
+        bot.edit_message_text(
+            f"✅ Đã bắt đầu spam {phone} {count} lần\n"
+            f"🆔 ID: {spam_id}\n"
+            f"📊 Sẽ gửi qua {len(otp_functions)} dịch vụ",
+            message.chat.id,
+            msg.message_id,
+            reply_markup=keyboard
+        )
+        
+        # Cập nhật thống kê user
+        users_collection.update_one(
+            {'user_id': message.from_user.id},
+            {'$inc': {'total_spam_requests': 1}}
+        )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi: {str(e)}")
+        logging.error(f"Error in handle_spam: {e}")
+
+def run_spam(spam_id, phone, count, otp_functions, chat_id, message_id):
+    """Hàm chạy spam trong thread riêng"""
+    global active_spams
+    
+    try:
+        success_count = 0
+        fail_count = 0
+        
+        for i in range(count):
+            if not active_spams.get(spam_id, {}).get('is_running', True):
+                break
+            
+            # Xáo trộn danh sách hàm
+            random.shuffle(otp_functions)
+            
+            # Chạy qua tất cả các hàm
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = []
+                for func in otp_functions:
+                    if not active_spams.get(spam_id, {}).get('is_running', True):
+                        break
+                    
+                    future = executor.submit(
+                        send_otp_with_log,
+                        func,
+                        phone,
+                        chat_id,
+                        message_id,
+                        spam_id,
+                        func.__name__
+                    )
+                    futures.append(future)
+                
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception as e:
+                        fail_count += 1
+                        logging.error(f"Error in spam thread: {e}")
+            
+            # Cập nhật tiến độ
+            if (i + 1) % 5 == 0 or (i + 1) == count:
+                progress = (i + 1) / count * 100
+                
+                try:
+                    keyboard = InlineKeyboardMarkup()
+                    keyboard.add(InlineKeyboardButton("❌ Hủy spam", callback_data=f"cancel_{spam_id}"))
+                    
+                    bot.edit_message_text(
+                        f"📊 Đang spam {phone}\n"
+                        f"📈 Tiến độ: {i + 1}/{count} ({progress:.1f}%)\n"
+                        f"✅ Thành công: {success_count}\n"
+                        f"❌ Thất bại: {fail_count}",
+                        chat_id,
+                        message_id,
+                        reply_markup=keyboard
+                    )
+                except:
+                    pass
+            
+            # Nghỉ giữa các đợt
+            if i < count - 1:
+                time.sleep(random.uniform(0.5, 2))
+        
+        # Hoàn thành
+        if spam_id in active_spams:
+            del active_spams[spam_id]
+        
+        try:
+            bot.edit_message_text(
+                f"🎉 Hoàn thành spam {phone}!\n"
+                f"📊 Tổng kết:\n"
+                f"• Số lần: {count}\n"
+                f"• Thành công: {success_count}\n"
+                f"• Thất bại: {fail_count}\n"
+                f"• Tỷ lệ: {(success_count/(success_count+fail_count)*100 if (success_count+fail_count)>0 else 0):.1f}%",
+                chat_id,
+                message_id
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        logging.error(f"Error in run_spam: {e}")
+        if spam_id in active_spams:
+            del active_spams[spam_id]
+
+def send_otp_with_log(func, phone, chat_id, message_id, spam_id, service_name):
+    """Gửi OTP và ghi log"""
+    try:
+        # Gửi OTP
+        func(phone)
+        
+        # Ghi log thành công
+        log_spam_activity(chat_id, phone, service_name, 'success')
+        return True
+        
+    except Exception as e:
+        # Ghi log thất bại
+        log_spam_activity(chat_id, phone, service_name, f'failed: {str(e)}')
+        return False
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_'))
+def handle_cancel_callback(call):
+    """Xử lý nút hủy spam"""
+    spam_id = call.data.replace('cancel_', '')
+    
+    if spam_id in active_spams:
+        active_spams[spam_id]['is_running'] = False
+        bot.answer_callback_query(call.id, "✅ Đã hủy spam!")
+        
+        # Xóa thông báo cũ
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        
+        bot.send_message(call.message.chat.id, f"⏹️ Đã hủy spam ID: {spam_id}")
+    else:
+        bot.answer_callback_query(call.id, "❌ Không tìm thấy spam đang chạy!")
+
+@bot.message_handler(commands=['cancel'])
+def handle_cancel_command(message):
+    """Hủy spam đang chạy của user"""
+    user_id = message.from_user.id
+    user_spams = {k: v for k, v in active_spams.items() if v['user_id'] == user_id}
+    
+    if not user_spams:
+        bot.reply_to(message, "⛔ Bạn không có spam nào đang chạy!")
         return
     
-    # Kiểm tra bot có đang bật spam không
-    if bot_settings_collection is not None:
-        settings = bot_settings_collection.find_one({})
-        if settings and not settings.get('spam_enabled', True):
-            bot.reply_to(message, "⏸️ Tính năng spam tạm thời bị tắt bởi admin")
-            return
+    # Dừng tất cả spam của user
+    for spam_id in user_spams:
+        active_spams[spam_id]['is_running'] = False
     
-    bot.reply_to(message, f"🚀 Bắt đầu spam đến {phone} {count} lần...")
-    
-    # Chạy spam trong thread riêng
-    threading.Thread(
-        target=run_spam,
-        args=(phone, count, message.chat.id, user_id),
-        daemon=True
-    ).start()
+    bot.reply_to(message, f"✅ Đã hủy {len(user_spams)} spam đang chạy!")
 
-@bot.message_handler(commands=['stop'])
-def stop_spam(message: Message):
-    user_id = message.from_user.id
-    # Tìm và dừng task của user
-    task_keys = [k for k in spam_tasks.keys() if k.startswith(f"{message.chat.id}_")]
-    if task_keys:
-        for task_key in task_keys:
-            spam_tasks[task_key]['running'] = False
-        bot.reply_to(message, "⏹️ Đang dừng các task spam của bạn...")
-    else:
-        bot.reply_to(message, "ℹ️ Không có task spam nào đang chạy")
+@bot.message_handler(commands=['status'])
+def handle_status(message):
+    """Hiển thị trạng thái bot"""
+    global is_spamming_active
+    
+    status_text = "✅ Đang hoạt động" if is_spamming_active else "⏸️ Đã tạm dừng"
+    active_count = len(active_spams)
+    
+    # Thống kê từ database
+    total_users = users_collection.count_documents({})
+    total_phones = users_collection.count_documents({'phone': {'$exists': True}})
+    total_spams = spam_history_collection.count_documents({})
+    blocked_phones = blocked_phones_collection.count_documents({'is_active': True})
+    
+    response = (
+        f"🤖 *TRẠNG THÁI BOT*\n"
+        f"┌─────────────────\n"
+        f"│ Trạng thái: {status_text}\n"
+        f"│ Spam đang chạy: {active_count}\n"
+        f"│ Tổng users: {total_users}\n"
+        f"│ Tổng số điện thoại: {total_phones}\n"
+        f"│ Tổng lần spam: {total_spams}\n"
+        f"│ Số bị block: {blocked_phones}\n"
+        f"│ Cooldown: {SPAM_COOLDOWN_HOURS} giờ\n"
+        f"│ Giới hạn spam: {MAX_SPAM_PER_PHONE} lần/số\n"
+        f"└─────────────────"
+    )
+    
+    bot.reply_to(message, response, parse_mode='Markdown')
 
 @bot.message_handler(commands=['mystats'])
-def my_stats(message: Message):
+def handle_mystats(message):
+    """Thống kê của user"""
     user_id = message.from_user.id
-    user_info = get_user_info(user_id)
     
-    today_spam = 0
-    if spam_logs_collection is not None:
-        start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_spam = spam_logs_collection.count_documents({
-            'user_id': user_id,
-            'timestamp': {'$gte': start_of_day}
-        })
-    
-    max_per_day = 10
-    if bot_settings_collection is not None:
-        settings = bot_settings_collection.find_one({})
-        if settings:
-            max_per_day = settings.get('max_spam_per_day', 10)
-    
-    last_spam_str = 'Chưa có'
-    if user_info.get('last_spam'):
-        last_spam_str = user_info['last_spam'].strftime('%H:%M %d/%m/%Y')
-    
-    created_at_str = 'Không rõ'
-    if user_info.get('created_at'):
-        created_at_str = user_info['created_at'].strftime('%d/%m/%Y')
-    
-    stats_text = f"""
-📊 THỐNG KÊ CÁ NHÂN:
-
-👤 User ID: {user_id}
-📅 Ngày tham gia: {created_at_str}
-🎯 Tổng số lần spam: {user_info.get('spam_count', 0)}
-📈 Hôm nay đã spam: {today_spam}/{max_per_day} lần
-⏰ Lần spam cuối: {last_spam_str}
-🔓 Trạng thái: {'🚫 Bị khóa' if user_info.get('is_banned') else '✅ Hoạt động'}
-{'👑 Quyền: Admin' if is_admin(user_id) else '👤 Quyền: User thường'}
-    """
-    bot.reply_to(message, stats_text)
-
-# ====================== LỆNH ADMIN ======================
-@bot.message_handler(commands=['admin'])
-def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "🚫 Bạn không có quyền truy cập!")
+    # Lấy thông tin user
+    user_info = users_collection.find_one({'user_id': user_id})
+    if not user_info:
+        bot.reply_to(message, "❌ Không tìm thấy thông tin của bạn!")
         return
     
-    # Lấy thông tin admin
-    admin_count = 0
-    if bot_settings_collection is not None:
-        settings = bot_settings_collection.find_one({})
-        if settings:
-            admin_count = len(settings.get('admin_ids', []))
+    # Thống kê spam
+    user_spams = list(spam_history_collection.find({'user_id': user_id}))
+    total_spams = len(user_spams)
     
-    admin_text = f"""
-👑 ADMIN PANEL:
+    # Phân loại theo dịch vụ
+    service_stats = {}
+    for spam in user_spams:
+        service = spam.get('service_name', 'unknown')
+        service_stats[service] = service_stats.get(service, 0) + 1
+    
+    # Tạo response
+    stats_text = f"📊 *THỐNG KÊ CỦA BẠN*\n"
+    stats_text += f"┌─────────────────\n"
+    stats_text += f"│ User ID: `{user_id}`\n"
+    stats_text += f"│ Username: @{user_info.get('username', 'N/A')}\n"
+    stats_text += f"│ Tham gia: {user_info.get('join_date', 'N/A')}\n"
+    stats_text += f"│ Lần spam: {user_info.get('total_spam_requests', 0)}\n"
+    stats_text += f"│ Tổng OTP đã gửi: {total_spams}\n"
+    stats_text += f"│ Spam đang chạy: {sum(1 for s in active_spams.values() if s['user_id'] == user_id)}\n"
+    stats_text += f"└─────────────────\n\n"
+    
+    # Top dịch vụ
+    if service_stats:
+        stats_text += "🏆 *TOP DỊCH VỤ ĐÃ DÙNG:*\n"
+        sorted_services = sorted(service_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+        for i, (service, count) in enumerate(sorted_services, 1):
+            stats_text += f"{i}. {service.replace('send_otp_via_', '')}: {count} lần\n"
+    
+    bot.reply_to(message, stats_text, parse_mode='Markdown')
 
-📊 /stats - Thống kê tổng quan
-👥 /users - Danh sách người dùng
-🔍 /logs <sdt> - Xem log spam
-⏸️ /toggle - Bật/tắt spam
-🔒 /ban <user_id> - Cấm người dùng
-🔓 /unban <user_id> - Bỏ cấm
-🛑 /stopall - Dừng tất cả spam
-➕ /addadmin <user_id> - Thêm admin
-➖ /removeadmin <user_id> - Xóa admin
-📝 /broadcast <tin nhắn> - Gửi thông báo
+# ==============================
+# ADMIN COMMANDS
+# ==============================
 
-👥 Tổng số admin: {admin_count}
-🔄 Task đang chạy: {len(spam_tasks)}
-    """
-    bot.reply_to(message, admin_text)
+@bot.message_handler(commands=['admin'])
+@admin_only
+def handle_admin(message):
+    """Hiển thị menu admin"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"),
+        InlineKeyboardButton("👥 Người dùng", callback_data="admin_users"),
+        InlineKeyboardButton("📱 Số điện thoại", callback_data="admin_phones"),
+        InlineKeyboardButton("🚫 Blocked", callback_data="admin_blocked"),
+        InlineKeyboardButton("⚙️ Cài đặt", callback_data="admin_settings"),
+        InlineKeyboardButton("📤 Export", callback_data="admin_export")
+    )
+    
+    bot.reply_to(message, "👑 *ADMIN PANEL* - Chọn chức năng:", 
+                parse_mode='Markdown', reply_markup=keyboard)
 
 @bot.message_handler(commands=['stats'])
-def admin_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
+@admin_only
+def handle_admin_stats(message):
+    """Thống kê tổng quan"""
+    # Tính toán các số liệu
+    total_users = users_collection.count_documents({})
+    active_today = users_collection.count_documents({
+        'last_active': {'$gte': datetime.now() - timedelta(days=1)}
+    })
+    total_phones = users_collection.count_documents({'phone': {'$exists': True}})
+    total_spams = spam_history_collection.count_documents({})
+    spams_today = spam_history_collection.count_documents({
+        'timestamp': {'$gte': datetime.now() - timedelta(days=1)}
+    })
+    blocked_count = blocked_phones_collection.count_documents({'is_active': True})
     
-    total_users = 0
-    total_spam_logs = 0
-    banned_users = 0
-    spam_last_24h = 0
+    # Top users
+    pipeline = [
+        {'$group': {'_id': '$user_id', 'count': {'$sum': 1}}},
+        {'$sort': {'count': -1}},
+        {'$limit': 5}
+    ]
+    top_users = list(spam_history_collection.aggregate(pipeline))
     
-    if users_collection is not None:
-        total_users = users_collection.count_documents({})
-        banned_users = users_collection.count_documents({'is_banned': True})
+    # Top phones
+    phone_pipeline = [
+        {'$group': {'_id': '$phone', 'count': {'$sum': 1}}},
+        {'$sort': {'count': -1}},
+        {'$limit': 5}
+    ]
+    top_phones = list(spam_history_collection.aggregate(phone_pipeline))
     
-    if spam_logs_collection is not None:
-        total_spam_logs = spam_logs_collection.count_documents({})
-        last_24h = datetime.now() - timedelta(hours=24)
-        spam_last_24h = spam_logs_collection.count_documents({'timestamp': {'$gte': last_24h}})
+    # Tạo response
+    stats_text = "📈 *THỐNG KÊ TỔNG QUAN*\n"
+    stats_text += "┌─────────────────\n"
+    stats_text += f"│ Tổng users: {total_users}\n"
+    stats_text += f"│ Active 24h: {active_today}\n"
+    stats_text += f"│ Tổng số điện thoại: {total_phones}\n"
+    stats_text += f"│ Tổng lần spam: {total_spams}\n"
+    stats_text += f"│ Spam 24h: {spams_today}\n"
+    stats_text += f"│ Số bị block: {blocked_count}\n"
+    stats_text += f"│ Spam đang chạy: {len(active_spams)}\n"
+    stats_text += "└─────────────────\n\n"
     
-    stats_text = f"""
-📈 THỐNG KÊ TỔNG QUAN:
-
-👥 Tổng người dùng: {total_users}
-🚫 Người dùng bị cấm: {banned_users}
-📨 Tổng log spam: {total_spam_logs}
-⏰ Spam 24h qua: {spam_last_24h}
-🔄 Task đang chạy: {len(spam_tasks)}
-💾 Database: {'✅ Kết nối' if db is not None else '❌ Không kết nối'}
-    """
-    bot.reply_to(message, stats_text)
+    stats_text += "🏆 *TOP USERS:*\n"
+    for i, user in enumerate(top_users, 1):
+        user_info = users_collection.find_one({'user_id': user['_id']})
+        username = user_info.get('username', 'N/A') if user_info else 'N/A'
+        stats_text += f"{i}. @{username} ({user['_id']}): {user['count']} lần\n"
+    
+    stats_text += "\n📱 *TOP SỐ ĐIỆN THOẠI:*\n"
+    for i, phone in enumerate(top_phones, 1):
+        phone_info = users_collection.find_one({'phone': phone['_id']})
+        block_status = "🚫" if phone_info and phone_info.get('is_blocked') else "✅"
+        stats_text += f"{i}. {phone['_id']}: {phone['count']} lần {block_status}\n"
+    
+    bot.reply_to(message, stats_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['users'])
-def list_users(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if users_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
+@admin_only
+def handle_admin_users(message):
+    """Danh sách người dùng"""
+    # Phân trang
     page = 1
-    args = message.text.split()
-    if len(args) > 1:
+    parts = message.text.split()
+    if len(parts) > 1:
         try:
-            page = int(args[1])
+            page = int(parts[1])
         except:
             pass
     
-    limit = 10
-    skip = (page - 1) * limit
+    items_per_page = 10
+    skip = (page - 1) * items_per_page
     
-    users = list(users_collection.find().sort('created_at', -1).skip(skip).limit(limit))
-    
-    users_text = f"👥 DANH SÁCH NGƯỜI DÙNG (Trang {page}):\n\n"
-    for user in users:
-        status = "🚫" if user.get('is_banned') else "✅"
-        admin_status = ""
-        if bot_settings_collection is not None:
-            settings = bot_settings_collection.find_one({})
-            if settings and user['user_id'] in settings.get('admin_ids', []):
-                admin_status = "👑"
-        users_text += f"{status}{admin_status} ID: {user['user_id']}\n"
-        if user.get('username'):
-            users_text += f"   @{user['username']}\n"
-        users_text += f"   📊: {user.get('spam_count', 0)} lần spam\n"
-        users_text += f"   📅: {user.get('created_at').strftime('%d/%m/%Y')}\n"
-        users_text += "─" * 20 + "\n"
-    
+    # Lấy users
     total_users = users_collection.count_documents({})
-    users_text += f"\n📄 Trang {page}/{total_users//limit + 1} | Tổng: {total_users} users"
-    users_text += f"\nSử dụng: /users {page+1} để xem trang tiếp theo"
+    users = list(users_collection.find().sort('last_active', -1).skip(skip).limit(items_per_page))
     
-    bot.reply_to(message, users_text)
+    # Tạo response
+    users_text = f"👥 *DANH SÁCH NGƯỜI DÙNG* (Trang {page})\n"
+    users_text += f"Tổng: {total_users} users\n\n"
+    
+    for i, user in enumerate(users, skip + 1):
+        user_id = user.get('user_id', 'N/A')
+        username = user.get('username', 'N/A')
+        first_name = user.get('first_name', '')
+        last_name = user.get('last_name', '')
+        spam_count = user.get('total_spam_requests', 0)
+        last_active = user.get('last_active', 'N/A')
+        
+        if isinstance(last_active, datetime):
+            last_active = last_active.strftime("%d/%m/%Y %H:%M")
+        
+        users_text += f"{i}. @{username} ({first_name} {last_name})\n"
+        users_text += f"   ├ ID: `{user_id}`\n"
+        users_text += f"   ├ Lần spam: {spam_count}\n"
+        users_text += f"   └ Active: {last_active}\n\n"
+    
+    # Tạo nút phân trang
+    keyboard = InlineKeyboardMarkup()
+    if page > 1:
+        keyboard.add(InlineKeyboardButton("⬅️ Trang trước", callback_data=f"users_page_{page-1}"))
+    if skip + items_per_page < total_users:
+        keyboard.add(InlineKeyboardButton("Trang sau ➡️", callback_data=f"users_page_{page+1}"))
+    
+    bot.reply_to(message, users_text, parse_mode='Markdown', reply_markup=keyboard)
 
-@bot.message_handler(commands=['logs'])
-def view_logs(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if spam_logs_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /logs <số điện thoại>")
-        return
-    
-    phone = args[1]
-    logs = list(spam_logs_collection.find({'phone_number': phone}).sort('timestamp', -1).limit(10))
-    
-    if not logs:
-        bot.reply_to(message, f"📭 Không tìm thấy log cho số {phone}")
-        return
-    
-    logs_text = f"📋 LOG SPAM CHO {phone}:\n\n"
-    for log in logs:
-        user_info = None
-        if users_collection is not None:
-            user_info = users_collection.find_one({'user_id': log['user_id']})
-        username = user_info.get('username', 'N/A') if user_info else 'N/A'
-        status = "✅" if log.get('success') else "❌"
-        logs_text += f"{status} {log['timestamp'].strftime('%H:%M %d/%m/%Y')}\n"
-        logs_text += f"   👤 User: {log['user_id']} ({username})\n"
-        logs_text += f"   🔢 Số lần: {log['count']}\n"
-        logs_text += "─" * 20 + "\n"
-    
-    total_logs = spam_logs_collection.count_documents({'phone_number': phone})
-    logs_text += f"\n📊 Tổng cộng: {total_logs} log"
-    
-    bot.reply_to(message, logs_text)
-
-@bot.message_handler(commands=['ban'])
-def ban_user(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if users_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /ban <user_id>")
-        return
-    
-    try:
-        user_id = int(args[1])
-    except:
-        bot.reply_to(message, "⚠️ User ID phải là số")
-        return
-    
-    result = users_collection.update_one(
-        {'user_id': user_id},
-        {'$set': {'is_banned': True}}
-    )
-    
-    if result.modified_count > 0:
-        bot.reply_to(message, f"✅ Đã cấm user {user_id}")
-        # Thông báo cho user
+@bot.message_handler(commands=['phones'])
+@admin_only
+def handle_admin_phones(message):
+    """Danh sách số điện thoại đã spam"""
+    # Phân trang
+    page = 1
+    parts = message.text.split()
+    if len(parts) > 1:
         try:
-            bot.send_message(user_id, "🚫 Tài khoản của bạn đã bị admin khóa!")
+            page = int(parts[1])
         except:
             pass
+    
+    items_per_page = 10
+    skip = (page - 1) * items_per_page
+    
+    # Lấy phones
+    pipeline = [
+        {'$match': {'phone': {'$exists': True}}},
+        {'$sort': {'last_spam': -1}},
+        {'$skip': skip},
+        {'$limit': items_per_page}
+    ]
+    
+    phones = list(users_collection.aggregate(pipeline))
+    total_phones = users_collection.count_documents({'phone': {'$exists': True}})
+    
+    # Tạo response
+    phones_text = f"📱 *DANH SÁCH SỐ ĐIỆN THOẠI* (Trang {page})\n"
+    phones_text += f"Tổng: {total_phones} số\n\n"
+    
+    for i, phone_data in enumerate(phones, skip + 1):
+        phone = phone_data.get('phone', 'N/A')
+        spam_count = phone_data.get('spam_count', 0)
+        first_spam = phone_data.get('first_spam', 'N/A')
+        last_spam = phone_data.get('last_spam', 'N/A')
+        is_blocked = phone_data.get('is_blocked', False)
+        
+        if isinstance(first_spam, datetime):
+            first_spam = first_spam.strftime("%d/%m/%Y")
+        if isinstance(last_spam, datetime):
+            last_spam = last_spam.strftime("%d/%m/%Y %H:%M")
+        
+        block_status = "🚫 BỊ BLOCK" if is_blocked else "✅ ĐANG HOẠT ĐỘNG"
+        
+        phones_text += f"{i}. *{phone}*\n"
+        phones_text += f"   ├ Số lần spam: {spam_count}\n"
+        phones_text += f"   ├ Lần đầu: {first_spam}\n"
+        phones_text += f"   ├ Lần cuối: {last_spam}\n"
+        phones_text += f"   └ Trạng thái: {block_status}\n\n"
+    
+    # Tạo nút phân trang và hành động
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    if page > 1:
+        keyboard.add(InlineKeyboardButton("⬅️ Trang trước", callback_data=f"phones_page_{page-1}"))
+    if skip + items_per_page < total_phones:
+        keyboard.add(InlineKeyboardButton("Trang sau ➡️", callback_data=f"phones_page_{page+1}"))
+    
+    # Nếu có số điện thoại, thêm nút block/unblock
+    if phones:
+        phone = phones[0].get('phone')
+        if phone:
+            if phones[0].get('is_blocked'):
+                keyboard.add(InlineKeyboardButton("🔓 Gỡ block", callback_data=f"unblock_{phone}"))
+            else:
+                keyboard.add(InlineKeyboardButton("🔒 Block", callback_data=f"block_{phone}"))
+    
+    bot.reply_to(message, phones_text, parse_mode='Markdown', reply_markup=keyboard)
+
+@bot.message_handler(commands=['block'])
+@admin_only
+def handle_block_phone(message):
+    """Block một số điện thoại"""
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /block <số điện thoại> [lý do]")
+        return
+    
+    phone = parts[1]
+    reason = " ".join(parts[2:]) if len(parts) > 2 else "Admin block"
+    
+    try:
+        block_phone(phone, reason)
+        bot.reply_to(message, f"✅ Đã block số {format_phone_number(phone)}\n📝 Lý do: {reason}")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi khi block: {str(e)}")
+
+@bot.message_handler(commands=['unblock'])
+@admin_only
+def handle_unblock_phone(message):
+    """Gỡ block một số điện thoại"""
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /unblock <số điện thoại>")
+        return
+    
+    phone = parts[1]
+    
+    try:
+        unblock_phone(phone)
+        bot.reply_to(message, f"✅ Đã gỡ block số {format_phone_number(phone)}")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi khi gỡ block: {str(e)}")
+
+@bot.message_handler(commands=['active'])
+@admin_only
+def handle_active_toggle(message):
+    """Bật/tắt bot"""
+    global is_spamming_active
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        status = "ON" if not is_spamming_active else "OFF"
+        bot.reply_to(message, f"⚠️ Sai cú pháp! Sử dụng: /active <on/off>\nTrạng thái hiện tại: {'ON' if is_spamming_active else 'OFF'}")
+        return
+    
+    action = parts[1].lower()
+    
+    if action in ['on', 'true', '1', 'start']:
+        is_spamming_active = True
+        bot.reply_to(message, "✅ Đã bật bot! Người dùng có thể spam OTP.")
+    elif action in ['off', 'false', '0', 'stop']:
+        is_spamming_active = False
+        bot.reply_to(message, "⏸️ Đã tắt bot! Người dùng không thể spam OTP.")
     else:
-        bot.reply_to(message, f"⚠️ Không tìm thấy user {user_id}")
+        bot.reply_to(message, "⚠️ Sai cú pháp! Sử dụng: /active <on/off>")
 
-@bot.message_handler(commands=['unban'])
-def unban_user(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if users_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /unban <user_id>")
-        return
-    
-    try:
-        user_id = int(args[1])
-    except:
-        bot.reply_to(message, "⚠️ User ID phải là số")
-        return
-    
-    result = users_collection.update_one(
-        {'user_id': user_id},
-        {'$set': {'is_banned': False}}
+@bot.message_handler(commands=['export'])
+@admin_only
+def handle_export(message):
+    """Xuất dữ liệu"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📊 Thống kê", callback_data="export_stats"),
+        InlineKeyboardButton("👥 Users", callback_data="export_users"),
+        InlineKeyboardButton("📱 Phones", callback_data="export_phones"),
+        InlineKeyboardButton("📝 Logs", callback_data="export_logs"),
+        InlineKeyboardButton("🚫 Blocked", callback_data="export_blocked")
     )
     
-    if result.modified_count > 0:
-        bot.reply_to(message, f"✅ Đã bỏ cấm user {user_id}")
-    else:
-        bot.reply_to(message, f"⚠️ Không tìm thấy user {user_id}")
+    bot.reply_to(message, "📤 *XUẤT DỮ LIỆU* - Chọn loại dữ liệu:", 
+                parse_mode='Markdown', reply_markup=keyboard)
 
-@bot.message_handler(commands=['addadmin'])
-def add_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if bot_settings_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /addadmin <user_id>")
-        return
-    
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') or 
+                          call.data.startswith('export_') or
+                          call.data.startswith('users_page_') or
+                          call.data.startswith('phones_page_') or
+                          call.data.startswith('block_') or
+                          call.data.startswith('unblock_'))
+def handle_admin_callbacks(call):
+    """Xử lý callback từ admin panel"""
     try:
-        new_admin_id = int(args[1])
-    except:
-        bot.reply_to(message, "⚠️ User ID phải là số")
-        return
-    
-    settings = bot_settings_collection.find_one({})
-    if not settings:
-        bot.reply_to(message, "❌ Không tìm thấy cài đặt bot!")
-        return
-    
-    admin_ids = settings.get('admin_ids', [])
-    if new_admin_id in admin_ids:
-        bot.reply_to(message, f"⚠️ User {new_admin_id} đã là admin!")
-        return
-    
-    admin_ids.append(new_admin_id)
-    bot_settings_collection.update_one(
-        {},
-        {'$set': {'admin_ids': admin_ids}}
-    )
-    
-    bot.reply_to(message, f"✅ Đã thêm user {new_admin_id} làm admin")
-    
-    # Thông báo cho user mới
-    try:
-        bot.send_message(new_admin_id, "👑 Bạn đã được thêm làm admin cho bot!")
-    except:
-        pass
+        if call.data.startswith('admin_'):
+            action = call.data.replace('admin_', '')
+            
+            if action == 'stats':
+                handle_admin_stats(call.message)
+            elif action == 'users':
+                handle_admin_users(call.message)
+            elif action == 'phones':
+                handle_admin_phones(call.message)
+            elif action == 'blocked':
+                # Hiển thị danh sách blocked phones
+                blocked = list(blocked_phones_collection.find({'is_active': True}))
+                if not blocked:
+                    bot.answer_callback_query(call.id, "📭 Không có số nào bị block!")
+                    return
+                
+                blocked_text = "🚫 *DANH SÁCH SỐ BỊ BLOCK*\n\n"
+                for i, phone in enumerate(blocked, 1):
+                    blocked_text += f"{i}. {phone.get('phone')}\n"
+                    blocked_text += f"   ├ Lý do: {phone.get('reason', 'N/A')}\n"
+                    blocked_text += f"   ├ Block lúc: {phone.get('blocked_at', 'N/A')}\n"
+                    blocked_text += f"   └ ID: {phone.get('_id')}\n\n"
+                
+                bot.edit_message_text(blocked_text, call.message.chat.id, 
+                                    call.message.message_id, parse_mode='Markdown')
+                
+            elif action == 'settings':
+                # Hiển thị cài đặt
+                settings_text = "⚙️ *CÀI ĐẶT HỆ THỐNG*\n\n"
+                settings_text += f"• MAX_THREADS: {MAX_THREADS}\n"
+                settings_text += f"• MAX_SPAM_PER_PHONE: {MAX_SPAM_PER_PHONE}\n"
+                settings_text += f"• SPAM_COOLDOWN_HOURS: {SPAM_COOLDOWN_HOURS}\n"
+                settings_text += f"• ADMIN_IDS: {ADMIN_IDS}\n"
+                settings_text += f"• DATABASE: {DATABASE_NAME}\n"
+                settings_text += f"• BOT STATUS: {'ACTIVE' if is_spamming_active else 'INACTIVE'}\n"
+                
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(
+                    InlineKeyboardButton("🔄 Reload", callback_data="admin_reload"),
+                    InlineKeyboardButton("⚡ Tối ưu", callback_data="admin_optimize")
+                )
+                
+                bot.edit_message_text(settings_text, call.message.chat.id, 
+                                    call.message.message_id, parse_mode='Markdown',
+                                    reply_markup=keyboard)
+                
+            elif action == 'export':
+                handle_export(call.message)
+                
+        elif call.data.startswith('export_'):
+            action = call.data.replace('export_', '')
+            bot.answer_callback_query(call.id, "⏳ Đang chuẩn bị dữ liệu...")
+            
+            # Trong thực tế, bạn sẽ xuất file và gửi qua Telegram
+            # Ở đây tôi chỉ hiển thị thông báo
+            bot.send_message(call.message.chat.id, 
+                           f"📤 Đang xuất dữ liệu {action}...\n"
+                           f"Chức năng này cần được triển khai thêm!")
+            
+        elif call.data.startswith('users_page_'):
+            page = int(call.data.replace('users_page_', ''))
+            msg = call.message
+            
+            # Cập nhật danh sách users với trang mới
+            handle_admin_users(msg)
+            
+        elif call.data.startswith('phones_page_'):
+            page = int(call.data.replace('phones_page_', ''))
+            msg = call.message
+            
+            # Cập nhật danh sách phones với trang mới
+            handle_admin_phones(msg)
+            
+        elif call.data.startswith('block_'):
+            phone = call.data.replace('block_', '')
+            block_phone(phone, "Block từ admin panel")
+            bot.answer_callback_query(call.id, f"✅ Đã block {phone}")
+            bot.edit_message_text(f"✅ Đã block số {phone}", call.message.chat.id, 
+                                call.message.message_id)
+            
+        elif call.data.startswith('unblock_'):
+            phone = call.data.replace('unblock_', '')
+            unblock_phone(phone)
+            bot.answer_callback_query(call.id, f"✅ Đã gỡ block {phone}")
+            bot.edit_message_text(f"✅ Đã gỡ block số {phone}", call.message.chat.id, 
+                                call.message.message_id)
+            
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Lỗi: {str(e)}")
+        logging.error(f"Error in admin callback: {e}")
 
-@bot.message_handler(commands=['removeadmin'])
-def remove_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if bot_settings_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /removeadmin <user_id>")
-        return
-    
-    try:
-        admin_id_to_remove = int(args[1])
-    except:
-        bot.reply_to(message, "⚠️ User ID phải là số")
-        return
-    
-    if admin_id_to_remove == message.from_user.id:
-        bot.reply_to(message, "⚠️ Bạn không thể tự xóa quyền admin của chính mình!")
-        return
-    
-    settings = bot_settings_collection.find_one({})
-    if not settings:
-        bot.reply_to(message, "❌ Không tìm thấy cài đặt bot!")
-        return
-    
-    admin_ids = settings.get('admin_ids', [])
-    if admin_id_to_remove not in admin_ids:
-        bot.reply_to(message, f"⚠️ User {admin_id_to_remove} không phải là admin!")
-        return
-    
-    admin_ids.remove(admin_id_to_remove)
-    bot_settings_collection.update_one(
-        {},
-        {'$set': {'admin_ids': admin_ids}}
-    )
-    
-    bot.reply_to(message, f"✅ Đã xóa user {admin_id_to_remove} khỏi danh sách admin")
-    
-    # Thông báo cho user bị xóa
-    try:
-        bot.send_message(admin_id_to_remove, "👤 Bạn đã bị xóa khỏi danh sách admin của bot!")
-    except:
-        pass
-
-@bot.message_handler(commands=['stopall'])
-def stop_all_spam(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    # Dừng tất cả task
-    task_count = len(spam_tasks)
-    for task_id in list(spam_tasks.keys()):
-        spam_tasks[task_id]['running'] = False
-    
-    spam_tasks.clear()
-    bot.reply_to(message, f"🛑 Đã dừng {task_count} task spam đang chạy")
-
-@bot.message_handler(commands=['toggle'])
-def toggle_spam(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if bot_settings_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    settings = bot_settings_collection.find_one({})
-    if not settings:
-        bot.reply_to(message, "❌ Không tìm thấy cài đặt bot!")
-        return
-    
-    new_status = not settings.get('spam_enabled', True)
-    
-    bot_settings_collection.update_one(
-        {},
-        {'$set': {'spam_enabled': new_status}}
-    )
-    
-    status_text = "BẬT ✅" if new_status else "TẮT ⏸️"
-    bot.reply_to(message, f"🔧 Đã {status_text} tính năng spam")
-    
-    # Thông báo broadcast nếu tắt
-    if not new_status:
-        try:
-            for task_id in spam_tasks:
-                spam_tasks[task_id]['running'] = False
-            spam_tasks.clear()
-            bot.reply_to(message, "🛑 Đã dừng tất cả spam đang chạy!")
-        except:
-            pass
-
-@bot.message_handler(commands=['broadcast'])
-def broadcast_message(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    if users_collection is None:
-        bot.reply_to(message, "❌ Không có kết nối database!")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Sử dụng: /broadcast <tin nhắn>")
-        return
-    
-    broadcast_msg = ' '.join(args[1:])
-    users = users_collection.find({}, {'user_id': 1})
-    
-    total_users = users_collection.count_documents({})
-    bot.reply_to(message, f"📢 Bắt đầu gửi thông báo đến {total_users} người dùng...")
-    
-    success = 0
-    failed = 0
-    for user in users:
-        try:
-            bot.send_message(user['user_id'], f"📣 THÔNG BÁO TỪ ADMIN:\n\n{broadcast_msg}")
-            success += 1
-        except:
-            failed += 1
-        time.sleep(0.1)  # Tránh bị rate limit
-    
-    bot.reply_to(message, f"✅ Đã gửi: {success} | ❌ Thất bại: {failed}")
-
-# ====================== FLASK SERVER ======================
-app = Flask(__name__)
+# ==============================
+# FLASK SERVER FOR RENDER
+# ==============================
 
 @app.route('/')
 def home():
-    db_status = '✅ Kết nối' if db is not None else '❌ Không kết nối'
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Spam SMS Bot</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
-            .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-            .status {{ padding: 10px; border-radius: 5px; margin: 10px 0; font-weight: bold; }}
-            .online {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
-            .stats {{ background: #e2e3e5; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-            .button {{ display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; margin: 10px 5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🤖 Spam SMS Telegram Bot</h1>
-            <div class="status online">
-                ✅ Bot đang hoạt động
-            </div>
-            <div class="stats">
-                <p><strong>📊 Thống kê:</strong></p>
-                <ul>
-                    <li>Database: {db_status}</li>
-                    <li>Task đang chạy: {len(spam_tasks)}</li>
-                    <li>Bot Uptime: Đang chạy...</li>
-                </ul>
-            </div>
-            <p><strong>📞 Liên hệ admin:</strong> @quocchienn</p>
-            <a href="/stats" class="button">API Stats</a>
-            <a href="https://t.me/spamsms_bot" class="button" style="background: #0088cc;">Telegram Bot</a>
-        </div>
-    </body>
-    </html>
-    """
+    return "🤖 OTP Spam Bot is running!"
+
+@app.route('/health')
+def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.route('/stats')
 def web_stats():
-    """API xem thống kê"""
-    total_users = users_collection.count_documents({}) if users_collection is not None else 0
-    total_spam = spam_logs_collection.count_documents({}) if spam_logs_collection is not None else 0
-    
-    return {
-        'status': 'online',
-        'timestamp': datetime.now().isoformat(),
-        'total_users': total_users,
-        'total_spam_requests': total_spam,
-        'active_tasks': len(spam_tasks),
-        'database_connected': db is not None
+    """API trả về thống kê"""
+    stats = {
+        'total_users': users_collection.count_documents({}),
+        'total_phones': users_collection.count_documents({'phone': {'$exists': True}}),
+        'total_spams': spam_history_collection.count_documents({}),
+        'active_spams': len(active_spams),
+        'blocked_phones': blocked_phones_collection.count_documents({'is_active': True}),
+        'bot_status': 'active' if is_spamming_active else 'inactive',
+        'timestamp': datetime.now().isoformat()
     }
+    return stats
 
-def run_bot():
-    print("🤖 Bắt đầu chạy bot Telegram...")
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            print(f"❌ Lỗi bot: {e}")
-            print("🔄 Khởi động lại bot sau 5 giây...")
-            time.sleep(5)
+@app.route('/stop', methods=['POST'])
+def stop_bot():
+    """API dừng bot (chỉ admin)"""
+    auth = request.headers.get('Authorization')
+    if auth != os.getenv('ADMIN_SECRET', 'default_secret'):
+        return {"error": "Unauthorized"}, 401
+    
+    global is_spamming_active
+    is_spamming_active = False
+    
+    # Dừng tất cả spam đang chạy
+    for spam_id in active_spams:
+        active_spams[spam_id]['is_running'] = False
+    
+    return {"status": "bot stopped", "active_spams_stopped": len(active_spams)}
+
+@app.route('/start', methods=['POST'])
+def start_bot():
+    """API khởi động bot (chỉ admin)"""
+    auth = request.headers.get('Authorization')
+    if auth != os.getenv('ADMIN_SECRET', 'default_secret'):
+        return {"error": "Unauthorized"}, 401
+    
+    global is_spamming_active
+    is_spamming_active = True
+    return {"status": "bot started"}
+
+# ==============================
+# KHỞI CHẠY
+# ==============================
+
+def run_flask():
+    """Chạy Flask server"""
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+
+def run_telegram_bot():
+    """Chạy Telegram bot"""
+    print("🤖 Starting Telegram Bot...")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 if __name__ == '__main__':
+    # Cấu hình logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
     print("=" * 50)
-    print("🤖 KHỞI ĐỘNG SPAM SMS BOT")
+    print("🚀 OTP SPAM BOT WITH ADMIN PANEL")
+    print("=" * 50)
+    print(f"📊 Database: {DATABASE_NAME}")
+    print(f"👑 Admins: {ADMIN_IDS}")
+    print(f"⚡ Max Threads: {MAX_THREADS}")
+    print(f"⏳ Cooldown: {SPAM_COOLDOWN_HOURS} hours")
+    print(f"📱 Max Spam/Phone: {MAX_SPAM_PER_PHONE}")
     print("=" * 50)
     
-    if MONGODB_URI:
-        print(f"📊 MongoDB URI: {MONGODB_URI[:20]}...")
-    else:
-        print("⚠️ Cảnh báo: Không có MONGODB_URI")
+    # Tạo index cho database
+    try:
+        users_collection.create_index([('user_id', 1)], unique=True)
+        users_collection.create_index([('phone', 1)])
+        users_collection.create_index([('last_active', -1)])
+        spam_history_collection.create_index([('timestamp', -1)])
+        spam_history_collection.create_index([('phone', 1)])
+        spam_history_collection.create_index([('user_id', 1)])
+        blocked_phones_collection.create_index([('phone', 1)], unique=True)
+        print("✅ Database indexes created!")
+    except Exception as e:
+        print(f"⚠️ Database index error: {e}")
     
-    if ADMIN_IDS:
-        print(f"👑 Admin IDs: {ADMIN_IDS}")
-    else:
-        print("⚠️ Cảnh báo: Không có ADMIN_IDS")
+    # Khởi chạy Flask trong thread riêng
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    # Kiểm tra admin
-    if bot_settings_collection is not None:
-        settings = bot_settings_collection.find_one({})
-        if settings:
-            admin_ids = settings.get('admin_ids', [])
-            print(f"✅ Đã tải {len(admin_ids)} admin từ database")
-    
-    # Chạy bot trong thread riêng
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Chạy Flask server
-    port = int(os.environ.get('PORT', 5000))
-    print(f"🌐 Khởi động Flask server trên port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Khởi chạy Telegram bot
+    try:
+        run_telegram_bot()
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
+        raise
