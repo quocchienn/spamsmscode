@@ -14,8 +14,8 @@ services:
       - key: ADMIN_SECRET
         generateValue: true
       - key: MAX_THREADS
-        value: "50"
+        value: "5000000000"
       - key: MAX_SPAM_PER_PHONE
-        value: "100"
+        value: "1000000000"
       - key: SPAM_COOLDOWN_HOURS
         value: "24"
