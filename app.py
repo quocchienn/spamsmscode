@@ -3307,7 +3307,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
        /cancel - Hủy tấn công
 
     ⚠️ *Giới hạn:*
-       • Tối đa 10 cuộc tấn công/người
+       • Tối đa 99999999999 cuộc tấn công/người
        • Cooldown 60 giây
     """
     
@@ -3422,8 +3422,8 @@ async def attack_service_button(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['service'] = service
     await query.edit_message_text(
         "🔢 *Nhập số lượng tin nhắn:*\n\n"
-        "• Tối đa: 100 tin\n"
-        "• Gõ số từ 1-100",
+        "• Tối đa: 999999999 tin\n"
+        "• Gõ số từ 1-999999999",
         parse_mode="Markdown"
     )
     
@@ -3440,8 +3440,8 @@ async def attack_service_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['service'] = service
     await update.message.reply_text(
         "🔢 *Nhập số lượng tin nhắn:*\n\n"
-        "• Tối đa: 100 tin\n"
-        "• Gõ số từ 1-100",
+        "• Tối đa: 999999999 tin\n"
+        "• Gõ số từ 1-999999",
         parse_mode="Markdown"
     )
     
@@ -3451,8 +3451,8 @@ async def attack_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý số lượng tin nhắn"""
     try:
         count = int(update.message.text.strip())
-        if count < 1 or count > 100:
-            await update.message.reply_text("❌ Số lượng phải từ 1-100!\nVui lòng nhập lại:")
+        if count < 1 or count > 9999:
+            await update.message.reply_text("❌ Số lượng phải từ 1-9999!\nVui lòng nhập lại:")
             return COUNT
     except ValueError:
         await update.message.reply_text("❌ Vui lòng nhập số hợp lệ!")
