@@ -12,9 +12,9 @@ services:
       - key: MONGODB_URI
         sync: false
       - key: MAX_THREADS
-        value: "20000000000000"
+        value: "200"
       - key: MAX_CONCURRENT_REQUESTS
-        value: "1000000000"
+        value: "100"
       - key: REQUEST_TIMEOUT
         value: "5"
       - key: MAX_RETRIES
