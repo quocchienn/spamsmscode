@@ -1,4 +1,3 @@
-pyTelegramBotAPI
-flask
-requests
-colorama
+pip install aiogram==3.0.0b7
+pip install requests
+pip install python-dotenv
