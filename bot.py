@@ -19,9 +19,9 @@ if not TOKEN or ':' not in TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-MAX_CONCURRENT_TARGETS   = 4
-MAX_THREADS_PER_TARGET   = 12
-DELAY_BETWEEN_ROUNDS_SEC = (6, 15)
+MAX_CONCURRENT_TARGETS   = 100000
+MAX_THREADS_PER_TARGET   = 100000
+DELAY_BETWEEN_ROUNDS_SEC = (1, 3)
 
 active_jobs = {}
 jobs_lock = threading.Lock()
